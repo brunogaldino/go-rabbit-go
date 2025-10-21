@@ -55,6 +55,11 @@ type Publisher struct {
 type RabbitMQConfigurations struct{}
 
 func (c *Client) NewPublisher(config []ExchangeOption) *Publisher {
+	if c.publisherCh != nil {
+		fmt.Println("Publisher already initialized, please use that one")
+		return c.publisherCh
+	}
+
 	newPub := &Publisher{
 		config:          config,
 		client:          c,

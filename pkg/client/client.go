@@ -148,11 +148,9 @@ func (c *Client) Disconnect() {
 	if len(c.consumerMap) > 0 {
 		fmt.Printf("terminating all consumers: %d\n", len(c.consumerMap))
 		for _, consumer := range c.consumerMap {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				consumer.Disconnect()
-			}()
+			})
 		}
 	}
 

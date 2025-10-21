@@ -1,4 +1,4 @@
-module github.com/Kanastra-Tech/go-rabbitmq-sdk
+module github.com/brunogaldino/go-rabbit-go
 
 go 1.25.0
 
