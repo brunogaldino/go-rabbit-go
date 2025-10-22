@@ -1,4 +1,4 @@
-package client
+package rabbitmq
 
 func WithRoutingKey(rks []string) func(*Consumer) {
 	return func(c *Consumer) {
