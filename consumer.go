@@ -72,10 +72,11 @@ func (c *Client) NewConsumer(queue string, callback func(string) error, options 
 
 	queueTable := amqp.Table{}
 	queueTable.SetClientConnectionName(hostname)
-	consumer.setRetryAndDLQ(queueTable)
+	consumer.setDLQueue(queueTable)
 
 	_, err = ch.QueueDeclare(consumer.params.Queue, true, consumer.params.AutoDelete, false, false, queueTable)
 	failOnError(err, "could not declare consumer queue")
+	consumer.setRetryExchange()
 
 	for _, ex := range consumer.params.RoutingKey {
 		err = ch.QueueBind(consumer.params.Queue, ex, consumer.params.ExchangeName, false, nil)
@@ -188,7 +189,7 @@ func (c *Consumer) deadletter(d amqp.Delivery) {
 	}
 }
 
-func (c *Consumer) setRetryAndDLQ(queueTable amqp.Table) {
+func (c *Consumer) setDLQueue(queueTable amqp.Table) {
 	if c.params.DeadletterStrategy.Enabled {
 		_, err := c.channel.QueueDeclare(c.params.DeadletterStrategy.DLQueueName, true, false, false, false,
 			amqp.Table{
@@ -199,7 +200,9 @@ func (c *Consumer) setRetryAndDLQ(queueTable amqp.Table) {
 		queueTable["x-dead-letter-routing-key"] = c.params.DeadletterStrategy.DLQueueName
 		queueTable["x-queue-type"] = "quorum"
 	}
+}
 
+func (c *Consumer) setRetryExchange() {
 	if c.params.RetryStrategy.Enabled {
 		err := c.channel.ExchangeDeclare(c.params.RetryStrategy.Exchange, "x-delayed-message", true, false, false, false, amqp.Table{
 			"x-delayed-type": "direct",
