@@ -48,11 +48,11 @@ func WithRetryFn(fn func(attempt int32) int32) func(*Consumer) {
 	}
 }
 
-func WithDLQDisabled() func(*Consumer) {
-	return func(c *Consumer) {
-		c.params.DeadletterStrategy.Enabled = false
-	}
-}
+// func WithDLQDisabled() func(*Consumer) {
+// 	return func(c *Consumer) {
+// 		c.params.DeadletterStrategy.Enabled = false
+// 	}
+// }
 
 func WithDLQFn(fn func(string) bool) func(*Consumer) {
 	return func(c *Consumer) {
