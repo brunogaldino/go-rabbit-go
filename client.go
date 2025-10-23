@@ -33,15 +33,16 @@ type Client struct {
 	isClosing      bool
 
 	publisherCh *Publisher
-	consumerMap []*Consumer
+	consumerMap map[string]*Consumer
 }
 
 func New(ctx context.Context, config Config) (*Client, *sync.WaitGroup) {
 	var wg sync.WaitGroup
 	return &Client{
-		conf: config,
-		ctx:  ctx,
-		wg:   &wg,
+		conf:        config,
+		ctx:         ctx,
+		wg:          &wg,
+		consumerMap: map[string]*Consumer{},
 	}, &wg
 }
 

@@ -10,7 +10,12 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
+type Delivery struct {
+	amqp.Delivery
+}
+
 type Consumer struct {
+	client       *Client
 	channel      *amqp.Channel
 	params       ConsumerOptions
 	wg           sync.WaitGroup
@@ -36,7 +41,7 @@ type ConsumerOptions struct {
 	ExchangeName       string
 	AutoDelete         bool
 	Prefetch           int
-	Callback           func(string) error
+	Callback           func(Delivery) error
 	RetryStrategy      *ConsumerRetry
 	DeadletterStrategy *ConsumerDeadletter
 }
@@ -58,7 +63,7 @@ var consumerDefaults = &ConsumerOptions{
 	},
 }
 
-func (c *Client) NewConsumer(queue string, callback func(string) error, options ...func(*Consumer)) *Consumer {
+func (c *Client) NewConsumer(queue string, callback func(Delivery) error, options ...func(*Consumer)) *Consumer {
 	consumer := &Consumer{params: *consumerDefaults}
 	consumer.setOptions(queue, callback, options)
 
@@ -70,7 +75,9 @@ func (c *Client) NewConsumer(queue string, callback func(string) error, options 
 	err = ch.Qos(consumer.params.Prefetch, 0, false)
 	failOnError(err, "set consumer QoS")
 
-	queueTable := amqp.Table{}
+	queueTable := amqp.Table{
+		"x-queue-type": "quorum",
+	}
 	queueTable.SetClientConnectionName(hostname)
 	consumer.setDLQueue(queueTable)
 
@@ -83,11 +90,11 @@ func (c *Client) NewConsumer(queue string, callback func(string) error, options 
 		failOnError(err, "could not bind consumer to exchange")
 	}
 
-	c.consumerMap = append(c.consumerMap, consumer)
+	c.consumerMap[consumer.consumerName] = consumer
 	return consumer
 }
 
-func (c *Consumer) setOptions(queue string, callback func(string) error, options []func(*Consumer)) {
+func (c *Consumer) setOptions(queue string, callback func(Delivery) error, options []func(*Consumer)) {
 	hostname, _ := os.Hostname()
 	c.params.Queue = queue
 	c.params.Callback = callback
@@ -109,24 +116,26 @@ func (c *Consumer) Begin() {
 	for d := range msgs {
 		c.wg.Add(1)
 
-		go func(d amqp.Delivery) {
+		go func(d Delivery) {
 			defer func() {
 				if r := recover(); r != nil {
 					fmt.Printf("recovered from panic in goroutine consumer: %v\n", r)
 					c.retry(d)
+					return
 				}
 
 				c.wg.Done()
 			}()
 
-			if err := c.params.Callback(string(d.Body)); err != nil {
+			if err := c.params.Callback(d); err != nil {
 				fmt.Printf("error when processing message: %v\n", err)
 				c.retry(d)
+				return
 			}
 
 			err := d.Ack(false)
 			failOnError(err, "could not ack message")
-		}(d)
+		}(Delivery{d})
 	}
 	<-forever
 }
@@ -142,27 +151,30 @@ func (c *Consumer) Disconnect() {
 	if err := c.channel.Close(); err != nil {
 		fmt.Printf("error closing consumer channel %s with RK: %s: %v", c.params.Queue, c.params.RoutingKey, err)
 	}
+
+	delete(c.client.consumerMap, c.consumerName)
 }
 
-func (c *Consumer) retry(d amqp.Delivery) {
+func (c *Consumer) retry(d Delivery) {
 	retryCount, ok := d.Headers["x-retries-count"].(int32)
 	if !ok {
 		retryCount = 1
 	}
 
-	if retryCount < int32(c.params.RetryStrategy.MaxAttempt) {
+	if c.params.RetryStrategy.Enabled && (retryCount < int32(c.params.RetryStrategy.MaxAttempt)) {
 		delayAmount := c.params.RetryStrategy.DelayFn(int32(retryCount))
 		fmt.Printf("Retrying attempt %d in %d ms\n", retryCount, delayAmount)
 		headers := mergeTable(d.Headers, amqp.Table{
 			"x-delay":         delayAmount,
 			"x-retries-count": retryCount + 1,
 		})
-		err := c.channel.Publish("retry", c.params.Queue, false, false, amqp.Publishing{
+		err := c.channel.Publish(c.params.RetryStrategy.Exchange, c.params.Queue, false, false, amqp.Publishing{
 			ContentType: "application/json",
 			Body:        d.Body,
 			Headers:     headers,
 		})
 		failOnError(err, "failed to publish message on retry")
+		fmt.Println(err)
 
 		err = d.Ack(false)
 		failOnError(err, "failed to ack original message - retry")
@@ -171,10 +183,19 @@ func (c *Consumer) retry(d amqp.Delivery) {
 	}
 }
 
-func (c *Consumer) deadletter(d amqp.Delivery) {
-	if c.params.DeadletterStrategy != nil && c.params.DeadletterStrategy.Enabled {
-		// TODO: Deal with recover and forcefully send to DeadLetter
-		skip := c.params.DeadletterStrategy.CallbackFn(string(d.Body))
+func (c *Consumer) deadletter(d Delivery) {
+	if c.params.DeadletterStrategy.Enabled {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Println("panic when running DLQFn, sending to DLQ forcefully")
+				d.Nack(false, false)
+			}
+		}()
+
+		skip := false
+		if c.params.DeadletterStrategy.CallbackFn != nil {
+			skip = c.params.DeadletterStrategy.CallbackFn(string(d.Body))
+		}
 
 		if skip {
 			err := d.Ack(false)
@@ -184,6 +205,7 @@ func (c *Consumer) deadletter(d amqp.Delivery) {
 			failOnError(err, "failed to nack - deadletter")
 		}
 	} else {
+		fmt.Printf("dlq strategy disabled")
 		err := d.Ack(false)
 		failOnError(err, "failed skip dlq strategy to ack - deadletter")
 	}
@@ -198,7 +220,6 @@ func (c *Consumer) setDLQueue(queueTable amqp.Table) {
 		failOnError(err, "could not declare DLQ")
 		queueTable["x-dead-letter-exchange"] = ""
 		queueTable["x-dead-letter-routing-key"] = c.params.DeadletterStrategy.DLQueueName
-		queueTable["x-queue-type"] = "quorum"
 	}
 }
 

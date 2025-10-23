@@ -2,7 +2,6 @@ package rabbitmq
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -35,7 +34,7 @@ type ExchangeOption struct {
 type PublishMessage struct {
 	Exchange   string
 	RoutingKey string
-	Message    any
+	Message    []byte
 }
 
 type Publisher struct {
@@ -148,7 +147,7 @@ func (p *Publisher) reconnect() {
 	p.connect()
 }
 
-func (p *Publisher) Publish(message []PublishMessage) error {
+func (p *Publisher) Publish(msg PublishMessage) error {
 	if p.client.isBlocked || p.client.isReconnecting {
 		i := 0
 		for !p.client.isBlocked || !p.client.isReconnecting {
@@ -164,52 +163,45 @@ func (p *Publisher) Publish(message []PublishMessage) error {
 	}
 
 	if p.publishConfirms {
-		p.publishWithConfirmation(message)
+		return p.publishWithConfirmation(msg)
 	} else {
-		p.publishWithoutConfimation(message)
+		return p.publishWithoutConfimation(msg)
 	}
-
-	return nil
 }
 
-func (p Publisher) publishWithConfirmation(messages []PublishMessage) {
-	for _, v := range messages {
-		// TODO: Deal with error later
-		bd, _ := json.Marshal(v.Message)
-		p.ch.PublishWithDeferredConfirm(v.Exchange,
-			v.RoutingKey,
-			false,
-			false,
-			amqp.Publishing{
-				ContentType: "application/json",
-				Body:        []byte(bd),
-			})
+func (p Publisher) publishWithConfirmation(msg PublishMessage) error {
+	if _, err := p.ch.PublishWithDeferredConfirm(msg.Exchange,
+		msg.RoutingKey,
+		false,
+		false,
+		amqp.Publishing{
+			ContentType: "application/json",
+			Body:        msg.Message,
+		}); err != nil {
+		return err
 	}
 
-	for range len(messages) {
+	for {
 		confirm := <-p.confirmCh
 		if confirm.Ack {
-			fmt.Printf("Confirmed delivery tag %d\n", confirm.DeliveryTag)
+			fmt.Printf("confirmed delivery tag %d\n", confirm.DeliveryTag)
+			return nil
 		} else {
-			fmt.Printf("Nack for delivery tag %d\n", confirm.DeliveryTag)
+			return fmt.Errorf("nack for delivery tag %d", confirm.DeliveryTag)
 		}
 	}
 }
 
-func (p Publisher) publishWithoutConfimation(messages []PublishMessage) {
+func (p Publisher) publishWithoutConfimation(msg PublishMessage) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	err := p.ch.PublishWithContext(ctx, msg.Exchange, msg.RoutingKey, false, false, amqp.Publishing{
+		ContentType:  "application/json",
+		Body:         msg.Message,
+		DeliveryMode: amqp.Persistent,
+	})
 
-	for _, v := range messages {
-		bd, _ := json.Marshal(v.Message)
-		err := p.ch.PublishWithContext(ctx, v.Exchange, v.RoutingKey, false, false, amqp.Publishing{
-			ContentType:  "application/json",
-			Body:         []byte(bd),
-			DeliveryMode: amqp.Persistent,
-		})
-		failOnError(err, "could not publish message")
-		log.Println("Sent message")
-	}
+	return err
 }
 
 func (p *Publisher) monitorChannel() {
