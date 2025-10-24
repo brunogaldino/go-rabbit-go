@@ -3,8 +3,10 @@ package rabbitmq
 import (
 	"crypto/rand"
 	"fmt"
+	"log"
 	"maps"
 	"os"
+	"strings"
 	"sync"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -81,8 +83,10 @@ func (c *Client) NewConsumer(queue string, callback func(Delivery) error, option
 	queueTable.SetClientConnectionName(hostname)
 	consumer.setDLQueue(queueTable)
 
-	_, err = ch.QueueDeclare(consumer.params.Queue, true, consumer.params.AutoDelete, false, false, queueTable)
-	failOnError(err, "could not declare consumer queue")
+	if _, err = ch.QueueDeclare(consumer.params.Queue, true, consumer.params.AutoDelete, false, false, queueTable); err != nil {
+		log.Fatalf("could not declare consumer queue %s[%s]: %v", consumer.params.Queue, strings.Join(consumer.params.RoutingKey, ","), err)
+	}
+
 	consumer.setRetryExchange()
 
 	for _, ex := range consumer.params.RoutingKey {
