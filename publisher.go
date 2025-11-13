@@ -32,9 +32,10 @@ type ExchangeOption struct {
 }
 
 type PublishMessage struct {
-	Exchange   string
-	RoutingKey string
-	Message    []byte
+	Exchange    string
+	RoutingKey  string
+	Message     []byte
+	ContentType string
 }
 
 type Publisher struct {
@@ -170,12 +171,16 @@ func (p *Publisher) Publish(msg PublishMessage) error {
 }
 
 func (p Publisher) publishWithConfirmation(msg PublishMessage) error {
+	if msg.ContentType == "" {
+		msg.ContentType = "application/json"
+	}
+
 	if _, err := p.ch.PublishWithDeferredConfirm(msg.Exchange,
 		msg.RoutingKey,
 		false,
 		false,
 		amqp.Publishing{
-			ContentType: "application/json",
+			ContentType: msg.ContentType,
 			Body:        msg.Message,
 		}); err != nil {
 		return err
@@ -184,7 +189,6 @@ func (p Publisher) publishWithConfirmation(msg PublishMessage) error {
 	for {
 		confirm := <-p.confirmCh
 		if confirm.Ack {
-			fmt.Printf("confirmed delivery tag %d\n", confirm.DeliveryTag)
 			return nil
 		} else {
 			return fmt.Errorf("nack for delivery tag %d", confirm.DeliveryTag)

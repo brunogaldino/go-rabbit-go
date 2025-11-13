@@ -172,8 +172,9 @@ func (c *Consumer) retry(d Delivery) {
 			"x-delay":         delayAmount,
 			"x-retries-count": retryCount + 1,
 		})
+
 		err := c.channel.Publish(c.params.RetryStrategy.Exchange, c.params.Queue, false, false, amqp.Publishing{
-			ContentType: "application/json",
+			ContentType: d.ContentType,
 			Body:        d.Body,
 			Headers:     headers,
 		})
