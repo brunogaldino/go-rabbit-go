@@ -16,6 +16,14 @@ type Delivery struct {
 	amqp.Delivery
 }
 
+// GetHeader returns the value of a header by key, or nil if not present.
+func (d Delivery) GetHeader(key string) interface{} {
+	if d.Headers == nil {
+		return nil
+	}
+	return d.Headers[key]
+}
+
 type Consumer struct {
 	client       *Client
 	channel      *amqp.Channel
@@ -46,6 +54,7 @@ type ConsumerOptions struct {
 	Callback           func(Delivery) error
 	RetryStrategy      *ConsumerRetry
 	DeadletterStrategy *ConsumerDeadletter
+	HeadersBinding     amqp.Table
 }
 
 var consumerDefaults = &ConsumerOptions{
@@ -90,7 +99,7 @@ func (c *Client) NewConsumer(queue string, callback func(Delivery) error, option
 	consumer.setRetryExchange()
 
 	for _, ex := range consumer.params.RoutingKey {
-		err = ch.QueueBind(consumer.params.Queue, ex, consumer.params.ExchangeName, false, nil)
+		err = ch.QueueBind(consumer.params.Queue, ex, consumer.params.ExchangeName, false, consumer.params.HeadersBinding)
 		failOnError(err, "could not bind consumer to exchange")
 	}
 
