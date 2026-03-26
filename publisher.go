@@ -36,6 +36,7 @@ type PublishMessage struct {
 	RoutingKey  string
 	Message     []byte
 	ContentType string
+	Headers     amqp.Table
 }
 
 type Publisher struct {
@@ -182,6 +183,7 @@ func (p Publisher) publishWithConfirmation(msg PublishMessage) error {
 		amqp.Publishing{
 			ContentType: msg.ContentType,
 			Body:        msg.Message,
+			Headers:     msg.Headers,
 		}); err != nil {
 		return err
 	}
@@ -203,6 +205,7 @@ func (p Publisher) publishWithoutConfimation(msg PublishMessage) error {
 		ContentType:  "application/json",
 		Body:         msg.Message,
 		DeliveryMode: amqp.Persistent,
+		Headers:      msg.Headers,
 	})
 
 	return err
