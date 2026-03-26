@@ -1,7 +1,5 @@
 package rabbitmq
 
-import amqp "github.com/rabbitmq/amqp091-go"
-
 func WithRoutingKey(rks []string) func(*Consumer) {
 	return func(c *Consumer) {
 		c.params.RoutingKey = rks
@@ -64,7 +62,7 @@ func WithDLQFn(fn func(string) bool) func(*Consumer) {
 
 // WithHeadersBinding sets custom header arguments used when binding the queue
 // to the exchange. Use this with exchanges of type "headers".
-func WithHeadersBinding(headers amqp.Table) func(*Consumer) {
+func WithHeadersBinding(headers map[string]any) func(*Consumer) {
 	return func(c *Consumer) {
 		c.params.HeadersBinding = headers
 	}

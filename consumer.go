@@ -54,7 +54,7 @@ type ConsumerOptions struct {
 	Callback           func(Delivery) error
 	RetryStrategy      *ConsumerRetry
 	DeadletterStrategy *ConsumerDeadletter
-	HeadersBinding     amqp.Table
+	HeadersBinding     map[string]any
 }
 
 var consumerDefaults = &ConsumerOptions{
@@ -99,7 +99,7 @@ func (c *Client) NewConsumer(queue string, callback func(Delivery) error, option
 	consumer.setRetryExchange()
 
 	for _, ex := range consumer.params.RoutingKey {
-		err = ch.QueueBind(consumer.params.Queue, ex, consumer.params.ExchangeName, false, consumer.params.HeadersBinding)
+		err = ch.QueueBind(consumer.params.Queue, ex, consumer.params.ExchangeName, false, amqp.Table(consumer.params.HeadersBinding))
 		failOnError(err, "could not bind consumer to exchange")
 	}
 
