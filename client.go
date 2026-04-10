@@ -36,6 +36,12 @@ type Client struct {
 	consumerMap map[string]*Consumer
 }
 
+type HealthStatus struct {
+	Connected    bool
+	Blocked      bool
+	Reconnecting bool
+}
+
 func New(ctx context.Context, config Config) (*Client, *sync.WaitGroup) {
 	var wg sync.WaitGroup
 	return &Client{
@@ -158,6 +164,14 @@ func (c *Client) Disconnect() {
 	wg.Wait()
 	c.conn.Close()
 	c.isConnected = false
+}
+
+func (c *Client) CheckHealth() HealthStatus {
+	return HealthStatus{
+		Connected:    c.isConnected,
+		Blocked:      c.isBlocked,
+		Reconnecting: c.isReconnecting,
+	}
 }
 
 func failOnError(err error, title string) {

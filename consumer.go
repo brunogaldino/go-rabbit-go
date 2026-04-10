@@ -17,7 +17,7 @@ type Delivery struct {
 }
 
 // GetHeader returns the value of a header by key, or nil if not present.
-func (d Delivery) GetHeader(key string) interface{} {
+func (d Delivery) GetHeader(key string) any {
 	if d.Headers == nil {
 		return nil
 	}
@@ -36,7 +36,7 @@ type ConsumerRetry struct {
 	Enabled    bool
 	Exchange   string
 	MaxAttempt int
-	DelayFn    func(attempt int32) int32
+	DelayFn    func(content Delivery, attempt int32, err error) int32
 }
 
 type ConsumerDeadletter struct {
@@ -47,11 +47,12 @@ type ConsumerDeadletter struct {
 
 type ConsumerOptions struct {
 	Queue              string
+	Connection         string
 	RoutingKey         []string
 	ExchangeName       string
 	AutoDelete         bool
 	Prefetch           int
-	Callback           func(Delivery) error
+	Callback           func(Delivery, string, string) error
 	RetryStrategy      *ConsumerRetry
 	DeadletterStrategy *ConsumerDeadletter
 	HeadersBinding     map[string]any
@@ -64,7 +65,7 @@ var consumerDefaults = &ConsumerOptions{
 		Enabled:    true,
 		Exchange:   "retry",
 		MaxAttempt: 5,
-		DelayFn: func(attempt int32) int32 {
+		DelayFn: func(d Delivery, attempt int32, err error) int32 {
 			return attempt * 1000
 		},
 	},
@@ -74,7 +75,7 @@ var consumerDefaults = &ConsumerOptions{
 	},
 }
 
-func (c *Client) NewConsumer(queue string, callback func(Delivery) error, options ...func(*Consumer)) *Consumer {
+func (c *Client) NewConsumer(queue string, callback func(Delivery, string, string) error, options ...func(*Consumer)) *Consumer {
 	consumer := &Consumer{params: *consumerDefaults}
 	consumer.setOptions(queue, callback, options)
 
@@ -89,12 +90,20 @@ func (c *Client) NewConsumer(queue string, callback func(Delivery) error, option
 	queueTable := amqp.Table{
 		"x-queue-type": "quorum",
 	}
+
 	queueTable.SetClientConnectionName(hostname)
 	consumer.setDLQueue(queueTable)
 
 	if _, err = ch.QueueDeclare(consumer.params.Queue, true, consumer.params.AutoDelete, false, false, queueTable); err != nil {
 		log.Fatalf("could not declare consumer queue %s[%s]: %v", consumer.params.Queue, strings.Join(consumer.params.RoutingKey, ","), err)
 	}
+
+	_, err = ch.QueueDeclare(fmt.Sprintf("%s.retry", consumer.params.Queue), true, false, false, false, amqp.Table{
+		"x-queue-type":              "quorum",
+		"x-dead-letter-exchange":    "",
+		"x-dead-letter-routing-key": consumer.params.Queue,
+	})
+	failOnError(err, "could not declare retry queue")
 
 	consumer.setRetryExchange()
 
@@ -107,7 +116,7 @@ func (c *Client) NewConsumer(queue string, callback func(Delivery) error, option
 	return consumer
 }
 
-func (c *Consumer) setOptions(queue string, callback func(Delivery) error, options []func(*Consumer)) {
+func (c *Consumer) setOptions(queue string, callback func(Delivery, string, string) error, options []func(*Consumer)) {
 	hostname, _ := os.Hostname()
 	c.params.Queue = queue
 	c.params.Callback = callback
@@ -120,7 +129,7 @@ func (c *Consumer) setOptions(queue string, callback func(Delivery) error, optio
 	}
 }
 
-func (c *Consumer) Begin() {
+func (c *Consumer) Begin(groups ...string) {
 	fmt.Printf("Beginning message consumer %s\n", c.params.Queue)
 	msgs, err := c.channel.Consume(c.params.Queue, c.consumerName, false, false, false, false, nil)
 	failOnError(err, "error beginning consumer")
@@ -133,16 +142,21 @@ func (c *Consumer) Begin() {
 			defer func() {
 				if r := recover(); r != nil {
 					fmt.Printf("recovered from panic in goroutine consumer: %v\n", r)
-					c.retry(d)
+					c.retry(d, err)
 					return
 				}
 
 				c.wg.Done()
 			}()
 
-			if err := c.params.Callback(d); err != nil {
+			origHeader, ok := d.Headers["x-original-routing-key"].(string)
+			if !ok {
+				origHeader = d.RoutingKey
+			}
+
+			if err := c.params.Callback(d, c.params.Queue, origHeader); err != nil {
 				fmt.Printf("error when processing message: %v\n", err)
-				c.retry(d)
+				c.retry(d, err)
 				return
 			}
 
@@ -168,21 +182,20 @@ func (c *Consumer) Disconnect() {
 	delete(c.client.consumerMap, c.consumerName)
 }
 
-func (c *Consumer) retry(d Delivery) {
+func (c *Consumer) retry(d Delivery, err error) {
 	retryCount, ok := d.Headers["x-retries-count"].(int32)
 	if !ok {
 		retryCount = 1
 	}
 
 	if c.params.RetryStrategy.Enabled && (retryCount < int32(c.params.RetryStrategy.MaxAttempt)) {
-		delayAmount := c.params.RetryStrategy.DelayFn(int32(retryCount))
-		fmt.Printf("Retrying attempt %d in %d ms\n", retryCount, delayAmount)
+		delayAmount := c.params.RetryStrategy.DelayFn(d, int32(retryCount), err)
 		headers := mergeTable(d.Headers, amqp.Table{
-			"x-delay":         delayAmount,
 			"x-retries-count": retryCount + 1,
 		})
 
 		err := c.channel.Publish(c.params.RetryStrategy.Exchange, c.params.Queue, false, false, amqp.Publishing{
+			Expiration:  string(delayAmount),
 			ContentType: d.ContentType,
 			Body:        d.Body,
 			Headers:     headers,
@@ -205,17 +218,17 @@ func (c *Consumer) deadletter(d Delivery) {
 			}
 		}()
 
-		skip := false
+		sendToDLQ := true
 		if c.params.DeadletterStrategy.CallbackFn != nil {
-			skip = c.params.DeadletterStrategy.CallbackFn(string(d.Body))
+			sendToDLQ = c.params.DeadletterStrategy.CallbackFn(string(d.Body))
 		}
 
-		if skip {
-			err := d.Ack(false)
-			failOnError(err, "failed to ack - deadletter")
-		} else {
+		if sendToDLQ {
 			err := d.Nack(false, false)
 			failOnError(err, "failed to nack - deadletter")
+		} else {
+			err := d.Ack(false)
+			failOnError(err, "failed to ack - deadletter")
 		}
 	} else {
 		fmt.Printf("dlq strategy disabled")
@@ -237,18 +250,19 @@ func (c *Consumer) setDLQueue(queueTable amqp.Table) {
 }
 
 func (c *Consumer) setRetryExchange() {
-	if c.params.RetryStrategy.Enabled {
-		err := c.channel.ExchangeDeclare(c.params.RetryStrategy.Exchange, "x-delayed-message", true, false, false, false, amqp.Table{
-			"x-delayed-type": "direct",
-		})
-		failOnError(err, "cannot declare retry exchange")
-
-		err = c.channel.QueueBind(c.params.Queue, c.params.Queue, c.params.RetryStrategy.Exchange, false, nil)
-		failOnError(err, "could not bind to queue")
-	} else {
-		err := c.channel.QueueUnbind(c.params.Queue, c.params.Queue, c.params.RetryStrategy.Exchange, nil)
-		failOnError(err, "could not unbind to retry to queue")
+	if !c.params.RetryStrategy.Enabled {
+		return
 	}
+
+	retryQueue := fmt.Sprintf("%s.retry", c.params.Queue)
+	err := c.channel.ExchangeDeclare(c.params.RetryStrategy.Exchange, "direct", true, false, false, false, amqp.Table{})
+	failOnError(err, "cannot declare retry exchange")
+
+	_, err = c.channel.QueueDeclare(retryQueue, true, false, false, false, amqp.Table{})
+	failOnError(err, "cannot declare retry exchange")
+
+	err = c.channel.QueueBind(c.params.Queue, c.params.Queue, c.params.RetryStrategy.Exchange, false, nil)
+	failOnError(err, "could not bind to queue")
 }
 
 func mergeTable(old amqp.Table, new amqp.Table) amqp.Table {

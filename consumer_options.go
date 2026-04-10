@@ -26,7 +26,7 @@ func WithAutoDelete() func(*Consumer) {
 
 func WithRetryDisabled() func(*Consumer) {
 	return func(c *Consumer) {
-		c.params.RetryStrategy.Enabled = true
+		c.params.RetryStrategy.Enabled = false
 	}
 }
 
@@ -42,17 +42,11 @@ func WithRetryMaxAttempt(max int) func(*Consumer) {
 	}
 }
 
-func WithRetryFn(fn func(attempt int32) int32) func(*Consumer) {
+func WithRetryFn(fn func(d Delivery, attempt int32, err error) int32) func(*Consumer) {
 	return func(c *Consumer) {
 		c.params.RetryStrategy.DelayFn = fn
 	}
 }
-
-// func WithDLQDisabled() func(*Consumer) {
-// 	return func(c *Consumer) {
-// 		c.params.DeadletterStrategy.Enabled = false
-// 	}
-// }
 
 func WithDLQFn(fn func(string) bool) func(*Consumer) {
 	return func(c *Consumer) {

@@ -183,7 +183,11 @@ func (p Publisher) publishWithConfirmation(msg PublishMessage) error {
 		amqp.Publishing{
 			ContentType: msg.ContentType,
 			Body:        msg.Message,
-			Headers:     amqp.Table(msg.Headers),
+			Headers: mergeTable(msg.Headers, amqp.Table{
+				"x-original-exchange":    msg.Exchange,
+				"x-original-routing-key": msg.RoutingKey,
+				"x-published-at":         time.Now().String(),
+			}),
 		}); err != nil {
 		return err
 	}
@@ -201,11 +205,16 @@ func (p Publisher) publishWithConfirmation(msg PublishMessage) error {
 func (p Publisher) publishWithoutConfimation(msg PublishMessage) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+
 	err := p.ch.PublishWithContext(ctx, msg.Exchange, msg.RoutingKey, false, false, amqp.Publishing{
 		ContentType:  "application/json",
 		Body:         msg.Message,
 		DeliveryMode: amqp.Persistent,
-		Headers:      amqp.Table(msg.Headers),
+		Headers: mergeTable(msg.Headers, amqp.Table{
+			"x-original-exchange":    msg.Exchange,
+			"x-original-routing-key": msg.RoutingKey,
+			"x-published-at":         time.Now().String(),
+		}),
 	})
 
 	return err
