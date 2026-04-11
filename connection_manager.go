@@ -18,15 +18,12 @@ type ConnectionConfig struct {
 type ConnectionManager struct {
 	ctx     context.Context
 	clients map[string]*Client
-	wg      *sync.WaitGroup
 }
 
-func NewConnectionManager(ctx context.Context, configs []ConnectionConfig) (*ConnectionManager, *sync.WaitGroup) {
-	var wg sync.WaitGroup
+func NewConnectionManager(ctx context.Context, configs []ConnectionConfig) *ConnectionManager {
 	cm := &ConnectionManager{
 		ctx:     ctx,
 		clients: make(map[string]*Client, len(configs)),
-		wg:      &wg,
 	}
 
 	for _, cfg := range configs {
@@ -38,7 +35,7 @@ func NewConnectionManager(ctx context.Context, configs []ConnectionConfig) (*Con
 		cm.clients[cfg.Name] = client
 	}
 
-	return cm, &wg
+	return cm
 }
 
 func (cm *ConnectionManager) ConnectAll() error {

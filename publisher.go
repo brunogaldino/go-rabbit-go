@@ -14,13 +14,13 @@ import (
 const (
 	ExchangeDirect = "direct"
 	ExchangeTopic  = "topic"
-	ExcangeFanout  = "fanout"
+	ExchangeFanout = "fanout"
 	ExchangeHeader = "header"
 )
 
 var errConnClosed = errors.New("RabbitMQ connection is closed")
 
-type ExchangeDeclarionOptions struct {
+type ExchangeDeclarationOptions struct {
 	Durable    *bool
 	AutoDelete *bool
 }
@@ -28,7 +28,7 @@ type ExchangeDeclarionOptions struct {
 type ExchangeOption struct {
 	Name    string
 	Type    string
-	Options ExchangeDeclarionOptions
+	Options ExchangeDeclarationOptions
 }
 
 type PublishMessage struct {
@@ -52,8 +52,6 @@ type Publisher struct {
 	isConnected    bool
 	isReconnecting bool
 }
-
-type RabbitMQConfigurations struct{}
 
 func (c *Client) NewPublisher(config []ExchangeOption) *Publisher {
 	if c.publisherCh != nil {
@@ -105,7 +103,7 @@ func (p *Publisher) connect() {
 				false,
 				false,
 				nil)
-			failOnError(err, "123 could not declare exchange")
+			failOnError(err, "could not declare exchange")
 		}
 	}
 
@@ -152,11 +150,10 @@ func (p *Publisher) reconnect() {
 func (p *Publisher) Publish(msg PublishMessage) error {
 	if p.client.isBlocked || p.client.isReconnecting {
 		i := 0
-		for !p.client.isBlocked || !p.client.isReconnecting {
+		for p.client.isBlocked || p.client.isReconnecting {
 			if i >= 5 {
 				return fmt.Errorf("connection is still blocked, could not publish")
 			}
-			fmt.Printf("Connection is blocked or is reconnecting, waiting befor publishing")
 			time.Sleep(5 * time.Second)
 			i++
 		}
@@ -167,7 +164,7 @@ func (p *Publisher) Publish(msg PublishMessage) error {
 	if p.publishConfirms {
 		return p.publishWithConfirmation(msg)
 	} else {
-		return p.publishWithoutConfimation(msg)
+		return p.publishWithoutConfirmation(msg)
 	}
 }
 
@@ -183,11 +180,11 @@ func (p Publisher) publishWithConfirmation(msg PublishMessage) error {
 		amqp.Publishing{
 			ContentType: msg.ContentType,
 			Body:        msg.Message,
-			Headers: mergeTable(msg.Headers, amqp.Table{
+			Headers: mergeTable(amqp.Table{
 				"x-original-exchange":    msg.Exchange,
 				"x-original-routing-key": msg.RoutingKey,
 				"x-published-at":         time.Now().String(),
-			}),
+			}, msg.Headers),
 		}); err != nil {
 		return err
 	}
@@ -202,19 +199,18 @@ func (p Publisher) publishWithConfirmation(msg PublishMessage) error {
 	}
 }
 
-func (p Publisher) publishWithoutConfimation(msg PublishMessage) error {
+func (p Publisher) publishWithoutConfirmation(msg PublishMessage) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-
 	err := p.ch.PublishWithContext(ctx, msg.Exchange, msg.RoutingKey, false, false, amqp.Publishing{
 		ContentType:  "application/json",
 		Body:         msg.Message,
 		DeliveryMode: amqp.Persistent,
-		Headers: mergeTable(msg.Headers, amqp.Table{
+		Headers: mergeTable(amqp.Table{
 			"x-original-exchange":    msg.Exchange,
 			"x-original-routing-key": msg.RoutingKey,
 			"x-published-at":         time.Now().String(),
-		}),
+		}, msg.Headers),
 	})
 
 	return err

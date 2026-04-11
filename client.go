@@ -34,6 +34,7 @@ type Client struct {
 
 	publisherCh *Publisher
 	consumerMap map[string]*Consumer
+	hostname    string
 }
 
 type HealthStatus struct {
@@ -43,21 +44,23 @@ type HealthStatus struct {
 }
 
 func New(ctx context.Context, config Config) (*Client, *sync.WaitGroup) {
+	host, _ := os.Hostname()
+
 	var wg sync.WaitGroup
 	return &Client{
 		conf:        config,
 		ctx:         ctx,
 		wg:          &wg,
 		consumerMap: map[string]*Consumer{},
+		hostname:    host,
 	}, &wg
 }
 
 func (c *Client) Connect() error {
-	host, _ := os.Hostname()
 	cfg := amqp.Config{
 		Heartbeat: c.conf.Heartbeat,
 		Properties: amqp.Table{
-			"connection_name": host,
+			"connection_name": c.hostname,
 		},
 	}
 
@@ -71,6 +74,8 @@ func (c *Client) Connect() error {
 	c.conn = conn
 	c.notifyBlock = make(chan amqp.Blocking, 1)
 	c.notifyError = make(chan *amqp.Error, 1)
+	c.isConnected = true
+	c.isReconnecting = false
 
 	c.conn.NotifyClose(c.notifyError)
 	c.conn.NotifyBlocked(c.notifyBlock)
