@@ -3,7 +3,6 @@ package rabbitmq
 import (
 	"crypto/rand"
 	"fmt"
-	"log"
 	"maps"
 	"strconv"
 	"strings"
@@ -74,39 +73,55 @@ var consumerDefaults = &ConsumerOptions{
 	},
 }
 
-func (c *Client) NewConsumer(queue string, callback func(Delivery, string, string) error, options ...func(*Consumer)) *Consumer {
-	consumer := &Consumer{params: *consumerDefaults}
+func (c *Client) NewConsumer(queue string, callback func(Delivery, string, string) error, options ...func(*Consumer)) (*Consumer, error) {
+	retryCopy := *consumerDefaults.RetryStrategy
+	dlCopy := *consumerDefaults.DeadletterStrategy
+	defaults := *consumerDefaults
+	defaults.RetryStrategy = &retryCopy
+	defaults.DeadletterStrategy = &dlCopy
+
+	consumer := &Consumer{params: defaults}
 	consumer.client = c
 
 	consumer.setOptions(queue, callback, options)
 
 	ch, err := c.conn.Channel()
-	failOnError(err, "open consumer channel")
+	if err != nil {
+		return nil, fmt.Errorf("open consumer channel: %w", err)
+	}
 	consumer.channel = ch
 
-	err = ch.Qos(consumer.params.Prefetch, 0, false)
-	failOnError(err, "set consumer QoS")
+	if err = ch.Qos(consumer.params.Prefetch, 0, false); err != nil {
+		return nil, fmt.Errorf("set consumer QoS: %w", err)
+	}
 
 	queueTable := amqp.Table{
 		"x-queue-type": "quorum",
 	}
 
 	queueTable.SetClientConnectionName(c.hostname)
-	consumer.setDLQueue(queueTable)
+	if err := consumer.setDLQueue(queueTable); err != nil {
+		return nil, err
+	}
 
 	if _, err = ch.QueueDeclare(consumer.params.Queue, true, consumer.params.AutoDelete, false, false, queueTable); err != nil {
-		log.Fatalf("could not declare consumer queue %s[%s]: %v", consumer.params.Queue, strings.Join(consumer.params.RoutingKey, ","), err)
+		return nil, fmt.Errorf("could not declare consumer queue %s[%s]: %w", consumer.params.Queue, strings.Join(consumer.params.RoutingKey, ","), err)
 	}
 
-	consumer.setRetryQueue()
+	if err := consumer.setRetryQueue(); err != nil {
+		return nil, err
+	}
 
 	for _, ex := range consumer.params.RoutingKey {
-		err = ch.QueueBind(consumer.params.Queue, ex, consumer.params.ExchangeName, false, amqp.Table(consumer.params.HeadersBinding))
-		failOnError(err, "could not bind consumer to exchange")
+		if err = ch.QueueBind(consumer.params.Queue, ex, consumer.params.ExchangeName, false, amqp.Table(consumer.params.HeadersBinding)); err != nil {
+			return nil, fmt.Errorf("could not bind consumer to exchange: %w", err)
+		}
 	}
 
+	c.mu.Lock()
 	c.consumerMap[consumer.consumerName] = consumer
-	return consumer
+	c.mu.Unlock()
+	return consumer, nil
 }
 
 func (c *Consumer) setOptions(queue string, callback func(Delivery, string, string) error, options []func(*Consumer)) {
@@ -121,10 +136,12 @@ func (c *Consumer) setOptions(queue string, callback func(Delivery, string, stri
 	}
 }
 
-func (c *Consumer) Begin(groups ...string) {
+func (c *Consumer) Begin(groups ...string) error {
 	fmt.Printf("Beginning message consumer %s\n", c.params.Queue)
 	msgs, err := c.channel.Consume(c.params.Queue, c.consumerName, false, false, false, false, nil)
-	failOnError(err, "error beginning consumer")
+	if err != nil {
+		return fmt.Errorf("error beginning consumer: %w", err)
+	}
 
 	// var forever chan struct{}
 	for d := range msgs {
@@ -152,10 +169,13 @@ func (c *Consumer) Begin(groups ...string) {
 			}
 
 			err := d.Ack(false)
-			failOnError(err, "could not ack message")
+			if err != nil {
+				fmt.Printf("could not ack message: %v\n", err)
+			}
 		}(Delivery{d})
 	}
 	// <-forever
+	return nil
 }
 
 func (c *Consumer) Disconnect() {
@@ -170,7 +190,9 @@ func (c *Consumer) Disconnect() {
 		fmt.Printf("error closing consumer channel %s with RK: %s: %v", c.params.Queue, c.params.RoutingKey, err)
 	}
 
+	c.client.mu.Lock()
 	delete(c.client.consumerMap, c.consumerName)
+	c.client.mu.Unlock()
 }
 
 func (c *Consumer) retry(d Delivery, err error) {
@@ -185,16 +207,20 @@ func (c *Consumer) retry(d Delivery, err error) {
 			"x-retries-count": retryCount + 1,
 		})
 
-		err := c.channel.Publish(c.params.RetryStrategy.Exchange, c.params.Queue, false, false, amqp.Publishing{
+		if pubErr := c.channel.Publish(c.params.RetryStrategy.Exchange, c.params.Queue, false, false, amqp.Publishing{
 			Expiration:  strconv.Itoa(int(delayAmount)),
 			ContentType: d.ContentType,
 			Body:        d.Body,
 			Headers:     headers,
-		})
-		failOnError(err, "failed to publish message on retry")
+		}); pubErr != nil {
+			fmt.Printf("failed to publish message on retry: %v\n", pubErr)
+			d.Nack(false, false)
+			return
+		}
 
-		err = d.Ack(false)
-		failOnError(err, "failed to ack original message - retry")
+		if ackErr := d.Ack(false); ackErr != nil {
+			fmt.Printf("failed to ack original message - retry: %v\n", ackErr)
+		}
 	} else {
 		c.deadletter(d)
 	}
@@ -215,49 +241,62 @@ func (c *Consumer) deadletter(d Delivery) {
 		}
 
 		if sendToDLQ {
-			err := d.Nack(false, false)
-			failOnError(err, "failed to nack - deadletter")
+			if err := d.Nack(false, false); err != nil {
+				fmt.Printf("failed to nack - deadletter: %v\n", err)
+			}
 		} else {
-			err := d.Ack(false)
-			failOnError(err, "failed to ack - deadletter")
+			if err := d.Ack(false); err != nil {
+				fmt.Printf("failed to ack - deadletter: %v\n", err)
+			}
 		}
 	} else {
 		fmt.Printf("dlq strategy disabled")
-		err := d.Ack(false)
-		failOnError(err, "failed skip dlq strategy to ack - deadletter")
+		if err := d.Ack(false); err != nil {
+			fmt.Printf("failed skip dlq strategy to ack - deadletter: %v\n", err)
+		}
 	}
 }
 
-func (c *Consumer) setDLQueue(queueTable amqp.Table) {
+func (c *Consumer) setDLQueue(queueTable amqp.Table) error {
 	if c.params.DeadletterStrategy.Enabled {
 		_, err := c.channel.QueueDeclare(c.params.DeadletterStrategy.DLQueueName, true, false, false, false,
 			amqp.Table{
 				"x-queue-type": "quorum",
 			})
-		failOnError(err, "could not declare DLQ")
+		if err != nil {
+			return fmt.Errorf("could not declare DLQ: %w", err)
+		}
 		queueTable["x-dead-letter-exchange"] = ""
 		queueTable["x-dead-letter-routing-key"] = c.params.DeadletterStrategy.DLQueueName
 	}
+	return nil
 }
 
-func (c *Consumer) setRetryQueue() {
+func (c *Consumer) setRetryQueue() error {
 	if !c.params.RetryStrategy.Enabled {
-		return
+		return nil
 	}
 
 	retryQueue := fmt.Sprintf("%s.retry", c.params.Queue)
 	err := c.channel.ExchangeDeclare(c.params.RetryStrategy.Exchange, "direct", true, false, false, false, amqp.Table{})
-	failOnError(err, "cannot declare retry exchange")
+	if err != nil {
+		return fmt.Errorf("cannot declare retry exchange: %w", err)
+	}
 
 	_, err = c.channel.QueueDeclare(retryQueue, true, false, false, false, amqp.Table{
 		"x-queue-type":              "quorum",
 		"x-dead-letter-exchange":    "",
 		"x-dead-letter-routing-key": c.params.Queue,
 	})
-	failOnError(err, "cannot declare retry exchange")
+	if err != nil {
+		return fmt.Errorf("cannot declare retry queue: %w", err)
+	}
 
 	err = c.channel.QueueBind(retryQueue, c.params.Queue, c.params.RetryStrategy.Exchange, false, nil)
-	failOnError(err, "could not bind to queue")
+	if err != nil {
+		return fmt.Errorf("could not bind retry queue: %w", err)
+	}
+	return nil
 }
 
 func mergeTable(old amqp.Table, new amqp.Table) amqp.Table {

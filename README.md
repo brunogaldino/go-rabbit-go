@@ -74,14 +74,20 @@ func main() {
     }
 
     // Set up publisher and consumers...
-    pub := client.NewPublisher([]rabbitmq.ExchangeOption{
+    pub, err := client.NewPublisher([]rabbitmq.ExchangeOption{
         {Name: "orders", Type: rabbitmq.ExchangeTopic},
     })
+    if err != nil {
+        panic(err)
+    }
 
-    cn := client.NewConsumer("orders.process", handleOrder,
+    cn, err := client.NewConsumer("orders.process", handleOrder,
         rabbitmq.WithExchangeName("orders"),
         rabbitmq.WithRoutingKey([]string{"order.created"}),
     )
+    if err != nil {
+        panic(err)
+    }
     go cn.Begin()
 
     // Block until shutdown signal
@@ -126,16 +132,22 @@ if err := cm.ConnectAll(); err != nil {
 }
 
 // Create consumers on specific connections
-orderConsumer := cm.NewConsumer("default", "orders.process", handleOrder,
+orderConsumer, err := cm.NewConsumer("default", "orders.process", handleOrder,
     rabbitmq.WithExchangeName("orders"),
     rabbitmq.WithRoutingKey([]string{"order.created"}),
 )
+if err != nil {
+    panic(err)
+}
 go orderConsumer.Begin()
 
-paymentConsumer := cm.NewConsumer("payments", "payments.process", handlePayment,
+paymentConsumer, err := cm.NewConsumer("payments", "payments.process", handlePayment,
     rabbitmq.WithExchangeName("payments"),
     rabbitmq.WithRoutingKey([]string{"payment.confirmed"}),
 )
+if err != nil {
+    panic(err)
+}
 go paymentConsumer.Begin()
 
 // Publish to a specific connection
@@ -160,11 +172,14 @@ AMQP channel, declares its queue (as a quorum queue), sets up retry and dead
 letter infrastructure, and binds to the specified exchange.
 
 ```go
-consumer := client.NewConsumer("my.queue", handler,
+consumer, err := client.NewConsumer("my.queue", handler,
     rabbitmq.WithExchangeName("my-exchange"),
     rabbitmq.WithRoutingKey([]string{"routing.key.one", "routing.key.two"}),
     rabbitmq.WithPrefetch(5),
 )
+if err != nil {
+    // handle error
+}
 
 go consumer.Begin()
 ```
@@ -223,10 +238,13 @@ retry strategy.
 A publisher is created per client and declares the exchanges it needs:
 
 ```go
-pub := client.NewPublisher([]rabbitmq.ExchangeOption{
+pub, err := client.NewPublisher([]rabbitmq.ExchangeOption{
     {Name: "orders", Type: rabbitmq.ExchangeTopic},
     {Name: "notifications", Type: rabbitmq.ExchangeDirect},
 })
+if err != nil {
+    // handle error
+}
 ```
 
 Each client supports a single publisher instance. Calling `NewPublisher()`
@@ -280,7 +298,7 @@ rabbitmq.WithRetryFn(func(d rabbitmq.Delivery, attempt int32, err error) int32 {
 ### Disabling retries
 
 ```go
-consumer := client.NewConsumer("my.queue", handler,
+consumer, err := client.NewConsumer("my.queue", handler,
     rabbitmq.WithRetryDisabled(),
 )
 ```
@@ -424,7 +442,7 @@ Convenience constants for exchange types:
 ```go
 rabbitmq.ExchangeDirect  // "direct"
 rabbitmq.ExchangeTopic   // "topic"
-rabbitmq.ExcangeFanout   // "fanout"
+rabbitmq.ExchangeFanout  // "fanout"
 rabbitmq.ExchangeHeader  // "header"
 ```
 

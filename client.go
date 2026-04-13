@@ -3,9 +3,9 @@ package rabbitmq
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -27,11 +27,12 @@ type Client struct {
 	notifyError      chan *amqp.Error
 	reconnectAttempt int
 
-	isConnected    bool
-	isBlocked      bool
-	isReconnecting bool
-	isClosing      bool
+	isConnected    atomic.Bool
+	isBlocked      atomic.Bool
+	isReconnecting atomic.Bool
+	isClosing      atomic.Bool
 
+	mu          sync.Mutex
 	publisherCh *Publisher
 	consumerMap map[string]*Consumer
 	hostname    string
@@ -74,8 +75,8 @@ func (c *Client) Connect() error {
 	c.conn = conn
 	c.notifyBlock = make(chan amqp.Blocking, 1)
 	c.notifyError = make(chan *amqp.Error, 1)
-	c.isConnected = true
-	c.isReconnecting = false
+	c.isConnected.Store(true)
+	c.isReconnecting.Store(false)
 
 	c.conn.NotifyClose(c.notifyError)
 	c.conn.NotifyBlocked(c.notifyBlock)
@@ -86,7 +87,7 @@ func (c *Client) Connect() error {
 }
 
 func (c *Client) reconnect() {
-	if c.isClosing {
+	if c.isClosing.Load() {
 		return
 	}
 
@@ -95,7 +96,7 @@ func (c *Client) reconnect() {
 		return
 	}
 
-	c.isReconnecting = true
+	c.isReconnecting.Store(true)
 	c.reconnectAttempt++
 	// TODO: Make a pushback to increase reconnection time
 	time.Sleep(5 * time.Second)
@@ -115,7 +116,7 @@ func (c *Client) monitorConnection() {
 	for {
 		select {
 		case blocking := <-c.notifyBlock:
-			c.isBlocked = blocking.Active
+			c.isBlocked.Store(blocking.Active)
 
 			if blocking.Active {
 				fmt.Printf("RabbitMQ connection is BLOCKED, reason: %s\n", blocking.Reason)
@@ -127,14 +128,15 @@ func (c *Client) monitorConnection() {
 				fmt.Printf("Connection closed: %v || isRecoverable: %t \n", err, err.Recover)
 
 				if !err.Recover {
-					c.isClosing = true
-					c.isConnected = false
-					log.Fatalf("Shutting down main connection permanently\n")
+					c.isClosing.Store(true)
+					c.isConnected.Store(false)
+					fmt.Println("Shutting down main connection permanently")
+					return
 				}
 			}
 
 			fmt.Println("Attempting reconnecting main connection")
-			c.isConnected = false
+			c.isConnected.Store(false)
 			c.reconnect()
 		case <-c.ctx.Done():
 			fmt.Println("gracefully shutting down all channels and connection via context")
@@ -146,20 +148,27 @@ func (c *Client) monitorConnection() {
 }
 
 func (c *Client) Disconnect() {
-	if c.conn.IsClosed() || c.isClosing {
-		fmt.Println("alreay disconnected", c.conn.IsClosed(), c.isClosing)
+	if c.conn.IsClosed() || c.isClosing.Load() {
+		fmt.Println("alreay disconnected", c.conn.IsClosed(), c.isClosing.Load())
 		return
 	}
-	c.isClosing = true
+	c.isClosing.Store(true)
 
 	wg := sync.WaitGroup{}
 	if c.publisherCh != nil {
 		c.publisherCh.Disconnect()
 	}
 
-	if len(c.consumerMap) > 0 {
-		fmt.Printf("terminating all consumers: %d\n", len(c.consumerMap))
-		for _, consumer := range c.consumerMap {
+	c.mu.Lock()
+	consumers := make([]*Consumer, 0, len(c.consumerMap))
+	for _, consumer := range c.consumerMap {
+		consumers = append(consumers, consumer)
+	}
+	c.mu.Unlock()
+
+	if len(consumers) > 0 {
+		fmt.Printf("terminating all consumers: %d\n", len(consumers))
+		for _, consumer := range consumers {
 			wg.Go(func() {
 				consumer.Disconnect()
 			})
@@ -168,19 +177,13 @@ func (c *Client) Disconnect() {
 
 	wg.Wait()
 	c.conn.Close()
-	c.isConnected = false
+	c.isConnected.Store(false)
 }
 
 func (c *Client) CheckHealth() HealthStatus {
 	return HealthStatus{
-		Connected:    c.isConnected,
-		Blocked:      c.isBlocked,
-		Reconnecting: c.isReconnecting,
-	}
-}
-
-func failOnError(err error, title string) {
-	if err != nil {
-		log.Fatalf("%s: %v", title, err)
+		Connected:    c.isConnected.Load(),
+		Blocked:      c.isBlocked.Load(),
+		Reconnecting: c.isReconnecting.Load(),
 	}
 }

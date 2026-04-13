@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"sync"
 	"time"
 
@@ -53,10 +52,10 @@ type Publisher struct {
 	isReconnecting bool
 }
 
-func (c *Client) NewPublisher(config []ExchangeOption) *Publisher {
+func (c *Client) NewPublisher(config []ExchangeOption) (*Publisher, error) {
 	if c.publisherCh != nil {
 		fmt.Println("Publisher already initialized, please use that one")
-		return c.publisherCh
+		return c.publisherCh, nil
 	}
 
 	newPub := &Publisher{
@@ -65,15 +64,19 @@ func (c *Client) NewPublisher(config []ExchangeOption) *Publisher {
 		publishConfirms: true,
 		wg:              &sync.WaitGroup{},
 	}
-	newPub.connect()
+	if err := newPub.connect(); err != nil {
+		return nil, err
+	}
 
 	c.publisherCh = newPub
-	return newPub
+	return newPub, nil
 }
 
-func (p *Publisher) connect() {
+func (p *Publisher) connect() error {
 	ch, err := p.client.conn.Channel()
-	failOnError(err, "could not create Publish channel")
+	if err != nil {
+		return fmt.Errorf("could not create Publish channel: %w", err)
+	}
 
 	p.notifyChanClose = make(chan *amqp.Error)
 	ch.NotifyClose(p.notifyChanClose)
@@ -81,7 +84,7 @@ func (p *Publisher) connect() {
 
 	if p.publishConfirms {
 		if err := ch.Confirm(false); err != nil {
-			failOnError(err, "failed to enable publish confirm mode")
+			return fmt.Errorf("failed to enable publish confirm mode: %w", err)
 		}
 
 		p.confirmCh = ch.NotifyPublish(make(chan amqp.Confirmation, 100))
@@ -103,13 +106,16 @@ func (p *Publisher) connect() {
 				false,
 				false,
 				nil)
-			failOnError(err, "could not declare exchange")
+			if err != nil {
+				return fmt.Errorf("could not declare exchange: %w", err)
+			}
 		}
 	}
 
 	p.wg.Add(1)
 	p.ch = ch
 	p.isConnected = true
+	return nil
 }
 
 func (p *Publisher) Disconnect() error {
@@ -130,7 +136,10 @@ func (p *Publisher) Disconnect() error {
 
 func (p *Publisher) reconnect() {
 	if p.reconnectAttempt >= 5 {
-		log.Fatalf("Maximum reconnection attempts reached")
+		fmt.Println("Maximum publisher reconnection attempts reached")
+		p.isConnected = false
+		p.isReconnecting = false
+		return
 	}
 
 	p.isReconnecting = true
@@ -148,16 +157,16 @@ func (p *Publisher) reconnect() {
 }
 
 func (p *Publisher) Publish(msg PublishMessage) error {
-	if p.client.isBlocked || p.client.isReconnecting {
+	if p.client.isBlocked.Load() || p.client.isReconnecting.Load() {
 		i := 0
-		for p.client.isBlocked || p.client.isReconnecting {
+		for p.client.isBlocked.Load() || p.client.isReconnecting.Load() {
 			if i >= 5 {
 				return fmt.Errorf("connection is still blocked, could not publish")
 			}
 			time.Sleep(5 * time.Second)
 			i++
 		}
-	} else if p.client.isClosing {
+	} else if p.client.isClosing.Load() {
 		return errConnClosed
 	}
 
@@ -168,7 +177,7 @@ func (p *Publisher) Publish(msg PublishMessage) error {
 	}
 }
 
-func (p Publisher) publishWithConfirmation(msg PublishMessage) error {
+func (p *Publisher) publishWithConfirmation(msg PublishMessage) error {
 	if msg.ContentType == "" {
 		msg.ContentType = "application/json"
 	}
@@ -199,7 +208,7 @@ func (p Publisher) publishWithConfirmation(msg PublishMessage) error {
 	}
 }
 
-func (p Publisher) publishWithoutConfirmation(msg PublishMessage) error {
+func (p *Publisher) publishWithoutConfirmation(msg PublishMessage) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	err := p.ch.PublishWithContext(ctx, msg.Exchange, msg.RoutingKey, false, false, amqp.Publishing{
@@ -222,7 +231,9 @@ func (p *Publisher) monitorChannel() {
 			fmt.Printf("publish channel closed: %s || recoverable: %t\n", err.Reason, err.Recover)
 
 			if !err.Recover {
-				log.Fatalf("Shutting down publisher channel permanently")
+				fmt.Println("Shutting down publisher channel permanently")
+				p.isConnected = false
+				return
 			}
 		}
 
