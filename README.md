@@ -9,6 +9,9 @@ An opinionated Go library for RabbitMQ with for the lazy
 - [Getting Started](#getting-started)
   - [Single connection](#single-connection)
   - [Multi-vhost connections](#multi-vhost-connections)
+- [Architecture](#architecture)
+  - [Dual connections](#dual-connections)
+  - [Consumer auto-recovery](#consumer-auto-recovery)
 - [Consumers](#consumers)
   - [Creating a consumer](#creating-a-consumer)
   - [Handler signature](#handler-signature)
@@ -94,7 +97,7 @@ func main() {
     wg.Wait()
 }
 
-func handleOrder(d rabbitmq.Delivery, queue string, originalRoutingKey string) error {
+func handleOrder(d rabbitmq.Delivery, queue string) error {
     // process message
     return nil
 }
@@ -108,7 +111,7 @@ connection is a self-contained unit with its own URI, exchanges, consumers,
 and reconnection loop.
 
 ```go
-cm, wg := rabbitmq.NewConnectionManager(ctx, []rabbitmq.ConnectionConfig{
+cm := rabbitmq.NewConnectionManager(ctx, []rabbitmq.ConnectionConfig{
     {
         Name:      "default",
         URI:       "amqp://guest:guest@localhost:5672/",
@@ -163,6 +166,34 @@ cm.Wait()
 The single-connection API (`New()` + `Connect()`) remains fully available.
 `ConnectionManager` is an opt-in layer for multi-vhost scenarios.
 
+## Architecture
+
+### Dual connections
+
+Each `Client` opens **two independent AMQP connections** to the broker:
+
+| Connection | Purpose | Identified as |
+|-----------|---------|---------------|
+| Publisher | All publish operations | `{hostname}-publisher` |
+| Consumer | All consumer channels | `{hostname}-consumer` |
+
+This isolation means:
+- **Flow control** (broker blocking) only affects the publisher — consumers keep processing.
+- **Reconnection** of one side doesn't tear down the other.
+- Each connection has its own monitor goroutine and reconnection loop.
+
+### Consumer auto-recovery
+
+`Begin()` automatically reconnects when the consumer channel or connection drops:
+
+1. The delivery channel closes → `Begin()` waits for in-flight handlers to finish.
+2. It polls until the consumer connection is re-established.
+3. It re-creates the AMQP channel, re-declares queues/bindings, and resumes consuming.
+
+This means callers don't need to implement retry logic around `Begin()` — it
+handles transient failures internally and only returns when the consumer is
+explicitly disconnected or the context is cancelled.
+
 ## Consumers
 
 ### Creating a consumer
@@ -185,7 +216,9 @@ go consumer.Begin()
 ```
 
 Call `Begin()` in a goroutine — it blocks and continuously processes messages
-until the consumer is disconnected or the channel is closed.
+until the consumer is disconnected or the context is cancelled. If the
+underlying channel or connection drops, `Begin()` automatically reconnects and
+resumes consuming (see [Consumer auto-recovery](#consumer-auto-recovery)).
 
 Since each consumer is started individually, you have full control over which
 consumers to activate per deployment:
@@ -204,14 +237,17 @@ s.consumePaymentProcessing()
 Every consumer handler follows the same signature:
 
 ```go
-func handler(d rabbitmq.Delivery, queue string, originalRoutingKey string) error
+func handler(d rabbitmq.Delivery, queue string) error
 ```
 
 | Parameter | Description |
 |-----------|-------------|
-| `d` | The message delivery, wrapping `amqp.Delivery` with a `GetHeader(key)` helper |
+| `d` | The message delivery, wrapping `amqp.Delivery` with `GetHeader(key)` and `GetRoutingKey()` helpers |
 | `queue` | The queue name the consumer is bound to |
-| `originalRoutingKey` | The original routing key (from `x-original-routing-key` header, or the current routing key if the header is not set) |
+
+Use `d.GetRoutingKey()` to get the original routing key — it reads from the
+`x-original-routing-key` header if present, falling back to the current
+routing key.
 
 Return `nil` to acknowledge the message. Return an `error` to trigger the
 retry strategy.
@@ -363,9 +399,9 @@ Every published message automatically includes the following headers:
 These headers preserve the original exchange and routing key, which would
 otherwise be lost when a message is routed through retry queues or the DLQ.
 
-The `originalRoutingKey` parameter in the consumer handler is derived from
-`x-original-routing-key` when available, falling back to the message's current
-routing key.
+The original routing key is accessible via `d.GetRoutingKey()` in the consumer
+handler — it reads from `x-original-routing-key` when available, falling back
+to the message's current routing key.
 
 User-provided headers in `PublishMessage.Headers` are merged with the
 automatic headers. User headers take precedence if there are conflicts.
@@ -377,9 +413,11 @@ Check the connection status of a client:
 ```go
 status := client.CheckHealth()
 
-fmt.Println(status.Connected)    // true/false
-fmt.Println(status.Blocked)      // true if the connection is blocked by the broker
-fmt.Println(status.Reconnecting) // true if a reconnection is in progress
+fmt.Println(status.Connected)          // true when both connections are up
+fmt.Println(status.PublisherConnected)  // publisher connection status
+fmt.Println(status.ConsumerConnected)   // consumer connection status
+fmt.Println(status.Blocked)            // true if the publisher is blocked by the broker
+fmt.Println(status.Reconnecting)       // true if any reconnection is in progress
 ```
 
 With `ConnectionManager`, get per-connection health:
@@ -399,7 +437,7 @@ the context is cancelled, the client:
 2. Waits for in-flight message handlers to complete
 3. Closes all consumer channels
 4. Closes the publisher channel
-5. Closes the connection
+5. Closes both connections (publisher and consumer)
 
 ```go
 ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

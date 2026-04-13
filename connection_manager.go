@@ -69,7 +69,7 @@ func (cm *ConnectionManager) Publisher(name string) *Publisher {
 	return cm.Client(name).publisherCh
 }
 
-func (cm *ConnectionManager) NewConsumer(connName, queue string, callback func(Delivery, string, string) error, opts ...func(*Consumer)) (*Consumer, error) {
+func (cm *ConnectionManager) NewConsumer(connName, queue string, callback func(Delivery, string) error, opts ...func(*Consumer)) (*Consumer, error) {
 	return cm.Client(connName).NewConsumer(queue, callback, opts...)
 }
 

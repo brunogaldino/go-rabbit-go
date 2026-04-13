@@ -73,7 +73,7 @@ func (c *Client) NewPublisher(config []ExchangeOption) (*Publisher, error) {
 }
 
 func (p *Publisher) connect() error {
-	ch, err := p.client.conn.Channel()
+	ch, err := p.client.publisherConn.Channel()
 	if err != nil {
 		return fmt.Errorf("could not create Publish channel: %w", err)
 	}
@@ -157,9 +157,9 @@ func (p *Publisher) reconnect() {
 }
 
 func (p *Publisher) Publish(msg PublishMessage) error {
-	if p.client.isBlocked.Load() || p.client.isReconnecting.Load() {
+	if p.client.isBlocked.Load() || p.client.isPubReconnecting.Load() {
 		i := 0
-		for p.client.isBlocked.Load() || p.client.isReconnecting.Load() {
+		for p.client.isBlocked.Load() || p.client.isPubReconnecting.Load() {
 			if i >= 5 {
 				return fmt.Errorf("connection is still blocked, could not publish")
 			}

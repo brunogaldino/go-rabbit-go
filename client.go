@@ -19,18 +19,25 @@ type Config struct {
 
 type Client struct {
 	conf Config
-	conn *amqp.Connection
 	ctx  context.Context
 	wg   *sync.WaitGroup
 
-	notifyBlock      chan amqp.Blocking
-	notifyError      chan *amqp.Error
-	reconnectAttempt int
+	publisherConn *amqp.Connection
+	consumerConn  *amqp.Connection
 
-	isConnected    atomic.Bool
-	isBlocked      atomic.Bool
-	isReconnecting atomic.Bool
-	isClosing      atomic.Bool
+	pubNotifyBlock chan amqp.Blocking
+	pubNotifyError chan *amqp.Error
+	conNotifyError chan *amqp.Error
+
+	pubReconnectAttempt int
+	conReconnectAttempt int
+
+	isPubConnected    atomic.Bool
+	isConConnected    atomic.Bool
+	isBlocked         atomic.Bool
+	isPubReconnecting atomic.Bool
+	isConReconnecting atomic.Bool
+	isClosing         atomic.Bool
 
 	mu          sync.Mutex
 	publisherCh *Publisher
@@ -39,9 +46,11 @@ type Client struct {
 }
 
 type HealthStatus struct {
-	Connected    bool
-	Blocked      bool
-	Reconnecting bool
+	Connected          bool
+	PublisherConnected bool
+	ConsumerConnected  bool
+	Blocked            bool
+	Reconnecting       bool
 }
 
 func New(ctx context.Context, config Config) (*Client, *sync.WaitGroup) {
@@ -57,99 +66,190 @@ func New(ctx context.Context, config Config) (*Client, *sync.WaitGroup) {
 	}, &wg
 }
 
-func (c *Client) Connect() error {
+func (c *Client) dial(suffix string) (*amqp.Connection, error) {
 	cfg := amqp.Config{
 		Heartbeat: c.conf.Heartbeat,
 		Properties: amqp.Table{
-			"connection_name": c.hostname,
+			"connection_name": fmt.Sprintf("%s-%s", c.hostname, suffix),
 		},
 	}
 
 	conn, err := amqp.DialConfig(c.conf.URI, cfg)
 	if err != nil {
-		fmt.Printf("could not connect to RabbitMQ broker: %v\n", err)
+		return nil, fmt.Errorf("could not connect to RabbitMQ broker (%s): %w", suffix, err)
+	}
+	return conn, nil
+}
+
+func (c *Client) connectPublisher() error {
+	conn, err := c.dial("publisher")
+	if err != nil {
 		return err
 	}
-	c.wg.Add(1)
 
-	c.conn = conn
-	c.notifyBlock = make(chan amqp.Blocking, 1)
-	c.notifyError = make(chan *amqp.Error, 1)
-	c.isConnected.Store(true)
-	c.isReconnecting.Store(false)
+	c.publisherConn = conn
+	c.pubNotifyBlock = make(chan amqp.Blocking, 1)
+	c.pubNotifyError = make(chan *amqp.Error, 1)
+	c.publisherConn.NotifyClose(c.pubNotifyError)
+	c.publisherConn.NotifyBlocked(c.pubNotifyBlock)
+	c.isPubConnected.Store(true)
+	c.isPubReconnecting.Store(false)
+	return nil
+}
 
-	c.conn.NotifyClose(c.notifyError)
-	c.conn.NotifyBlocked(c.notifyBlock)
+func (c *Client) connectConsumer() error {
+	conn, err := c.dial("consumer")
+	if err != nil {
+		return err
+	}
 
-	go c.monitorConnection()
+	c.consumerConn = conn
+	c.conNotifyError = make(chan *amqp.Error, 1)
+	c.consumerConn.NotifyClose(c.conNotifyError)
+	c.isConConnected.Store(true)
+	c.isConReconnecting.Store(false)
+	return nil
+}
+
+func (c *Client) Connect() error {
+	if err := c.connectPublisher(); err != nil {
+		return err
+	}
+	if err := c.connectConsumer(); err != nil {
+		c.publisherConn.Close()
+		return err
+	}
+
+	c.wg.Add(2)
+	go c.monitorPublisherConn()
+	go c.monitorConsumerConn()
 
 	return nil
 }
 
-func (c *Client) reconnect() {
+func (c *Client) reconnectPublisher() {
 	if c.isClosing.Load() {
 		return
 	}
-
-	if c.reconnectAttempt >= c.conf.MaxReconnectAttempts {
-		fmt.Println("Maximum reconnection attempts reached")
+	if c.pubReconnectAttempt >= c.conf.MaxReconnectAttempts {
+		fmt.Println("Maximum publisher reconnection attempts reached")
 		return
 	}
 
-	c.isReconnecting.Store(true)
-	c.reconnectAttempt++
-	// TODO: Make a pushback to increase reconnection time
+	c.isPubReconnecting.Store(true)
+	c.pubReconnectAttempt++
+	// TODO: exponential backoff with jitter
 	time.Sleep(5 * time.Second)
 
-	if c.conn != nil {
-		c.conn.Close()
+	if c.publisherConn != nil && !c.publisherConn.IsClosed() {
+		c.publisherConn.Close()
 	}
 
-	if err := c.Connect(); err == nil {
-		c.reconnectAttempt = 0
-		fmt.Println("sucessfully reconnected")
-		return
+	if err := c.connectPublisher(); err == nil {
+		c.pubReconnectAttempt = 0
+		fmt.Println("successfully reconnected publisher connection")
+
+		if c.publisherCh != nil {
+			if err := c.publisherCh.connect(); err != nil {
+				fmt.Printf("failed to reconnect publisher channel: %v\n", err)
+			}
+		}
 	}
 }
 
-func (c *Client) monitorConnection() {
+func (c *Client) reconnectConsumer() {
+	if c.isClosing.Load() {
+		return
+	}
+	if c.conReconnectAttempt >= c.conf.MaxReconnectAttempts {
+		fmt.Println("Maximum consumer reconnection attempts reached")
+		return
+	}
+
+	c.isConReconnecting.Store(true)
+	c.conReconnectAttempt++
+	// TODO: exponential backoff with jitter
+	time.Sleep(5 * time.Second)
+
+	if c.consumerConn != nil && !c.consumerConn.IsClosed() {
+		c.consumerConn.Close()
+	}
+
+	if err := c.connectConsumer(); err == nil {
+		c.conReconnectAttempt = 0
+		fmt.Println("successfully reconnected consumer connection")
+		// Consumer Begin() loops detect isConConnected and re-setup automatically
+	}
+}
+
+func (c *Client) monitorPublisherConn() {
+	defer c.wg.Done()
+
 	for {
 		select {
-		case blocking := <-c.notifyBlock:
+		case blocking := <-c.pubNotifyBlock:
 			c.isBlocked.Store(blocking.Active)
 
 			if blocking.Active {
-				fmt.Printf("RabbitMQ connection is BLOCKED, reason: %s\n", blocking.Reason)
+				fmt.Printf("RabbitMQ publisher connection is BLOCKED, reason: %s\n", blocking.Reason)
 			} else {
-				fmt.Println("RabbitMQ connection is UNBLOCKED")
+				fmt.Println("RabbitMQ publisher connection is UNBLOCKED")
 			}
-		case err := <-c.notifyError:
+		case err := <-c.pubNotifyError:
 			if err != nil {
-				fmt.Printf("Connection closed: %v || isRecoverable: %t \n", err, err.Recover)
+				fmt.Printf("Publisher connection closed: %v || isRecoverable: %t\n", err, err.Recover)
 
 				if !err.Recover {
-					c.isClosing.Store(true)
-					c.isConnected.Store(false)
-					fmt.Println("Shutting down main connection permanently")
+					c.isPubConnected.Store(false)
+					fmt.Println("Shutting down publisher connection permanently")
 					return
 				}
 			}
 
-			fmt.Println("Attempting reconnecting main connection")
-			c.isConnected.Store(false)
-			c.reconnect()
+			fmt.Println("Attempting to reconnect publisher connection")
+			c.isPubConnected.Store(false)
+			c.reconnectPublisher()
+			if c.isClosing.Load() {
+				return
+			}
 		case <-c.ctx.Done():
-			fmt.Println("gracefully shutting down all channels and connection via context")
+			fmt.Println("gracefully shutting down connections via context")
 			c.Disconnect()
-			c.wg.Done()
+			return
+		}
+	}
+}
+
+func (c *Client) monitorConsumerConn() {
+	defer c.wg.Done()
+
+	for {
+		select {
+		case err := <-c.conNotifyError:
+			if err != nil {
+				fmt.Printf("Consumer connection closed: %v || isRecoverable: %t\n", err, err.Recover)
+
+				if !err.Recover {
+					c.isConConnected.Store(false)
+					fmt.Println("Shutting down consumer connection permanently")
+					return
+				}
+			}
+
+			fmt.Println("Attempting to reconnect consumer connection")
+			c.isConConnected.Store(false)
+			c.reconnectConsumer()
+			if c.isClosing.Load() {
+				return
+			}
+		case <-c.ctx.Done():
 			return
 		}
 	}
 }
 
 func (c *Client) Disconnect() {
-	if c.conn.IsClosed() || c.isClosing.Load() {
-		fmt.Println("alreay disconnected", c.conn.IsClosed(), c.isClosing.Load())
+	if c.isClosing.Load() {
 		return
 	}
 	c.isClosing.Store(true)
@@ -176,14 +276,26 @@ func (c *Client) Disconnect() {
 	}
 
 	wg.Wait()
-	c.conn.Close()
-	c.isConnected.Store(false)
+
+	if c.publisherConn != nil && !c.publisherConn.IsClosed() {
+		c.publisherConn.Close()
+	}
+	if c.consumerConn != nil && !c.consumerConn.IsClosed() {
+		c.consumerConn.Close()
+	}
+
+	c.isPubConnected.Store(false)
+	c.isConConnected.Store(false)
 }
 
 func (c *Client) CheckHealth() HealthStatus {
+	pubConn := c.isPubConnected.Load()
+	conConn := c.isConConnected.Load()
 	return HealthStatus{
-		Connected:    c.isConnected.Load(),
-		Blocked:      c.isBlocked.Load(),
-		Reconnecting: c.isReconnecting.Load(),
+		Connected:          pubConn && conConn,
+		PublisherConnected: pubConn,
+		ConsumerConnected:  conConn,
+		Blocked:            c.isBlocked.Load(),
+		Reconnecting:       c.isPubReconnecting.Load() || c.isConReconnecting.Load(),
 	}
 }
