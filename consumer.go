@@ -33,7 +33,6 @@ type Consumer struct {
 
 type ConsumerRetry struct {
 	Enabled    bool
-	Exchange   string
 	MaxAttempt int
 	DelayFn    func(content Delivery, attempt int32, err error) int32
 }
@@ -61,7 +60,6 @@ var consumerDefaults = &ConsumerOptions{
 	Prefetch:   10,
 	RetryStrategy: &ConsumerRetry{
 		Enabled:    true,
-		Exchange:   "retry",
 		MaxAttempt: 5,
 		DelayFn: func(d Delivery, attempt int32, err error) int32 {
 			return attempt * 1000
@@ -203,11 +201,13 @@ func (c *Consumer) retry(d Delivery, err error) {
 
 	if c.params.RetryStrategy.Enabled && (retryCount < int32(c.params.RetryStrategy.MaxAttempt)) {
 		delayAmount := c.params.RetryStrategy.DelayFn(d, int32(retryCount), err)
+
 		headers := mergeTable(d.Headers, amqp.Table{
 			"x-retries-count": retryCount + 1,
 		})
 
-		if pubErr := c.channel.Publish(c.params.RetryStrategy.Exchange, c.params.Queue, false, false, amqp.Publishing{
+		retryQueue := fmt.Sprintf("%s.retry", c.params.Queue)
+		if pubErr := c.channel.Publish("", retryQueue, false, false, amqp.Publishing{
 			Expiration:  strconv.Itoa(int(delayAmount)),
 			ContentType: d.ContentType,
 			Body:        d.Body,
@@ -278,12 +278,7 @@ func (c *Consumer) setRetryQueue() error {
 	}
 
 	retryQueue := fmt.Sprintf("%s.retry", c.params.Queue)
-	err := c.channel.ExchangeDeclare(c.params.RetryStrategy.Exchange, "direct", true, false, false, false, amqp.Table{})
-	if err != nil {
-		return fmt.Errorf("cannot declare retry exchange: %w", err)
-	}
-
-	_, err = c.channel.QueueDeclare(retryQueue, true, false, false, false, amqp.Table{
+	_, err := c.channel.QueueDeclare(retryQueue, true, false, false, false, amqp.Table{
 		"x-queue-type":              "quorum",
 		"x-dead-letter-exchange":    "",
 		"x-dead-letter-routing-key": c.params.Queue,
@@ -291,18 +286,15 @@ func (c *Consumer) setRetryQueue() error {
 	if err != nil {
 		return fmt.Errorf("cannot declare retry queue: %w", err)
 	}
-
-	err = c.channel.QueueBind(retryQueue, c.params.Queue, c.params.RetryStrategy.Exchange, false, nil)
-	if err != nil {
-		return fmt.Errorf("could not bind retry queue: %w", err)
-	}
 	return nil
 }
 
-func mergeTable(old amqp.Table, new amqp.Table) amqp.Table {
-	merged := amqp.Table{}
-	maps.Copy(merged, old)
-	maps.Copy(merged, new)
+func mergeTable(base, override amqp.Table) amqp.Table {
+	merged := maps.Clone(base)
+	if merged == nil {
+		merged = amqp.Table{}
+	}
+	maps.Copy(merged, override)
 	return merged
 }
 

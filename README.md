@@ -225,7 +225,6 @@ retry strategy.
 | `WithPrefetch(n)` | Channel prefetch count | `10` |
 | `WithAutoDelete()` | Mark queue as auto-delete | `false` |
 | `WithRetryDisabled()` | Disable retry strategy | enabled |
-| `WithRetryExchangeName(name)` | Custom retry exchange name | `"retry"` |
 | `WithRetryMaxAttempt(n)` | Max retry attempts | `5` |
 | `WithRetryFn(fn)` | Custom delay function | `attempt * 1000` ms |
 | `WithDLQFn(fn)` | Callback before sending to DLQ | `nil` |
@@ -277,7 +276,6 @@ By default, every consumer has retries enabled with:
 
 - **Max attempts:** 5
 - **Delay function:** `attempt * 1000` (1s, 2s, 3s, 4s, 5s)
-- **Retry exchange:** `"retry"` (direct exchange)
 
 When the handler returns an error (or panics), the message is published to
 the retry queue with a TTL. Once the TTL expires, the message is routed back
@@ -312,11 +310,10 @@ The retry mechanism uses native RabbitMQ features — no plugins required:
 
 1. For each consumer queue `{queue}`, the library declares:
    - `{queue}.retry` — a quorum queue with `x-dead-letter-exchange: ""` and `x-dead-letter-routing-key: {queue}`
-   - A `direct` exchange (default name: `"retry"`) bound to the retry queue
 
-2. On failure, the message is published to the retry exchange with the
-   `expiration` property set to the delay amount. The message sits in
-   `{queue}.retry` until the TTL expires.
+2. On failure, the message is published directly to `{queue}.retry` via the
+   AMQP default exchange (`""`) with the `expiration` property set to the
+   delay amount. The message sits in `{queue}.retry` until the TTL expires.
 
 3. When TTL expires, RabbitMQ dead-letters the message back to the original
    `{queue}` via the DLX configuration.

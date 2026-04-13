@@ -30,12 +30,6 @@ func WithRetryDisabled() func(*Consumer) {
 	}
 }
 
-func WithRetryExchangeName(ex string) func(c *Consumer) {
-	return func(c *Consumer) {
-		c.params.RetryStrategy.Exchange = ex
-	}
-}
-
 func WithRetryMaxAttempt(max int) func(*Consumer) {
 	return func(c *Consumer) {
 		c.params.RetryStrategy.MaxAttempt = max
