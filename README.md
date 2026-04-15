@@ -1,17 +1,22 @@
 # go-rabbit-go
 
-An opinionated Go library for RabbitMQ with for the lazy
+[![Go Reference](https://pkg.go.dev/badge/github.com/brunogaldino/go-rabbit-go.svg)](https://pkg.go.dev/github.com/brunogaldino/go-rabbit-go)
+
+An opinionated Go library for RabbitMQ — automatic reconnection, retry
+queues, dead letter handling, and publisher confirms out of the box.
 
 ## Table of Contents
 
 - [Installation](#installation)
 - [Requirements](#requirements)
+- [Packages](#packages)
 - [Getting Started](#getting-started)
   - [Single connection](#single-connection)
   - [Multi-vhost connections](#multi-vhost-connections)
 - [Architecture](#architecture)
   - [Dual connections](#dual-connections)
   - [Consumer auto-recovery](#consumer-auto-recovery)
+  - [Project layout](#project-layout)
 - [Consumers](#consumers)
   - [Creating a consumer](#creating-a-consumer)
   - [Handler signature](#handler-signature)
@@ -30,6 +35,8 @@ An opinionated Go library for RabbitMQ with for the lazy
 - [Health Check](#health-check)
 - [Graceful Shutdown](#graceful-shutdown)
 - [Exchange Types](#exchange-types)
+- [Custom Logger](#custom-logger)
+- [Error Types](#error-types)
 - [License](#license)
 
 ## Installation
@@ -43,12 +50,24 @@ go get github.com/brunogaldino/go-rabbit-go
 - Go 1.25+
 - RabbitMQ 3.10+ (quorum queue per-message TTL support)
 
+## Packages
+
+The library is split into focused, independent packages:
+
+| Package | Import | Description |
+|---------|--------|-------------|
+| `rabbitmq` | `github.com/brunogaldino/go-rabbit-go` | Root — shared types: `Logger`, `ChannelError`, sentinel errors |
+| `client` | `github.com/brunogaldino/go-rabbit-go/client` | Connection lifecycle, reconnection, health checks |
+| `consumer` | `github.com/brunogaldino/go-rabbit-go/consumer` | Queue consumers with retry and dead-letter strategies |
+| `publisher` | `github.com/brunogaldino/go-rabbit-go/publisher` | Exchange publishers with confirms |
+| `manager` | `github.com/brunogaldino/go-rabbit-go/manager` | Multi-vhost connection manager |
+| `amqpx` | `github.com/brunogaldino/go-rabbit-go/amqpx` | AMQP interface abstractions (`AMQPConnection`, `AMQPChannel`, `Dialer`) |
+
 ## Getting Started
 
 ### Single connection
 
-For applications that connect to a single RabbitMQ broker/vhost, use `New()` to
-create a client:
+For applications that connect to a single RabbitMQ broker/vhost:
 
 ```go
 package main
@@ -59,45 +78,55 @@ import (
     "syscall"
     "time"
 
-    rabbitmq "github.com/brunogaldino/go-rabbit-go"
+    "github.com/brunogaldino/go-rabbit-go/client"
+    "github.com/brunogaldino/go-rabbit-go/consumer"
+    "github.com/brunogaldino/go-rabbit-go/publisher"
 )
 
 func main() {
     ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
     defer stop()
 
-    client, wg := rabbitmq.New(ctx, rabbitmq.Config{
+    c, wg := client.New(ctx, client.Config{
         URI:                  "amqp://guest:guest@localhost:5672/",
         Heartbeat:            10 * time.Second,
         MaxReconnectAttempts: 10,
     })
 
-    if err := client.Connect(); err != nil {
+    if err := c.Connect(); err != nil {
         panic(err)
     }
 
-    // Set up publisher and consumers...
-    pub, err := client.NewPublisher([]rabbitmq.ExchangeOption{
-        {Name: "orders", Type: rabbitmq.ExchangeTopic},
+    // Set up publisher
+    pub, err := publisher.New(c.PublisherConn(), []publisher.ExchangeOption{
+        {Name: "orders", Type: publisher.ExchangeTopic},
     })
     if err != nil {
         panic(err)
     }
 
-    cn, err := client.NewConsumer("orders.process", handleOrder,
-        rabbitmq.WithExchangeName("orders"),
-        rabbitmq.WithRoutingKey([]string{"order.created"}),
+    // Set up consumer
+    cons, err := consumer.New(c, "orders.process", handleOrder,
+        consumer.WithExchangeName("orders"),
+        consumer.WithRoutingKey([]string{"order.created"}),
     )
     if err != nil {
         panic(err)
     }
-    go cn.Begin()
+    wg.Go(func() { cons.Begin() })
+
+    // Publish a message
+    pub.Publish(publisher.Message{
+        Exchange:   "orders",
+        RoutingKey: "order.created",
+        Message:    []byte(`{"orderId": "123"}`),
+    })
 
     // Block until shutdown signal
     wg.Wait()
 }
 
-func handleOrder(d rabbitmq.Delivery, queue string) error {
+func handleOrder(d consumer.Delivery, queue string) error {
     // process message
     return nil
 }
@@ -106,26 +135,31 @@ func handleOrder(d rabbitmq.Delivery, queue string) error {
 ### Multi-vhost connections
 
 When your application needs to consume from or publish to multiple RabbitMQ
-vhosts (or entirely different brokers), use `NewConnectionManager()`. Each
-connection is a self-contained unit with its own URI, exchanges, consumers,
-and reconnection loop.
+vhosts (or entirely different brokers), use the `manager` package. Each
+connection is a self-contained unit with its own URI, reconnection loop, and
+lifecycle.
 
 ```go
-cm := rabbitmq.NewConnectionManager(ctx, []rabbitmq.ConnectionConfig{
+import (
+    "github.com/brunogaldino/go-rabbit-go/client"
+    "github.com/brunogaldino/go-rabbit-go/consumer"
+    "github.com/brunogaldino/go-rabbit-go/manager"
+    "github.com/brunogaldino/go-rabbit-go/publisher"
+)
+
+cm := manager.New(ctx, []manager.ConnectionConfig{
     {
-        Name:      "default",
-        URI:       "amqp://guest:guest@localhost:5672/",
-        Heartbeat: 10 * time.Second,
-        Exchanges: []rabbitmq.ExchangeOption{
-            {Name: "orders", Type: rabbitmq.ExchangeTopic},
+        Name:   "default",
+        Config: client.Config{
+            URI:       "amqp://guest:guest@localhost:5672/",
+            Heartbeat: 10 * time.Second,
         },
     },
     {
-        Name:      "payments",
-        URI:       "amqp://guest:guest@payments-rabbit:5672/payments",
-        Heartbeat: 10 * time.Second,
-        Exchanges: []rabbitmq.ExchangeOption{
-            {Name: "payments", Type: rabbitmq.ExchangeTopic},
+        Name:   "payments",
+        Config: client.Config{
+            URI:       "amqp://guest:guest@payments-rabbit:5672/payments",
+            Heartbeat: 10 * time.Second,
         },
     },
 })
@@ -134,37 +168,24 @@ if err := cm.ConnectAll(); err != nil {
     panic(err)
 }
 
-// Create consumers on specific connections
-orderConsumer, err := cm.NewConsumer("default", "orders.process", handleOrder,
-    rabbitmq.WithExchangeName("orders"),
-    rabbitmq.WithRoutingKey([]string{"order.created"}),
-)
-if err != nil {
-    panic(err)
-}
-go orderConsumer.Begin()
+// Get a specific client and create consumers/publishers on it
+defaultClient := cm.Client("default")
 
-paymentConsumer, err := cm.NewConsumer("payments", "payments.process", handlePayment,
-    rabbitmq.WithExchangeName("payments"),
-    rabbitmq.WithRoutingKey([]string{"payment.confirmed"}),
-)
-if err != nil {
-    panic(err)
-}
-go paymentConsumer.Begin()
-
-// Publish to a specific connection
-cm.Publisher("default").Publish(rabbitmq.PublishMessage{
-    Exchange:   "orders",
-    RoutingKey: "order.created",
-    Message:    []byte(`{"orderId": "123"}`),
+pub, _ := publisher.New(defaultClient.PublisherConn(), []publisher.ExchangeOption{
+    {Name: "orders", Type: publisher.ExchangeTopic},
 })
+
+cons, _ := consumer.New(defaultClient, "orders.process", handleOrder,
+    consumer.WithExchangeName("orders"),
+    consumer.WithRoutingKey([]string{"order.created"}),
+)
+go cons.Begin()
 
 cm.Wait()
 ```
 
-The single-connection API (`New()` + `Connect()`) remains fully available.
-`ConnectionManager` is an opt-in layer for multi-vhost scenarios.
+The single-connection API (`client.New()` + `Connect()`) remains fully available.
+`manager` is an opt-in layer for multi-vhost scenarios.
 
 ## Architecture
 
@@ -178,6 +199,7 @@ Each `Client` opens **two independent AMQP connections** to the broker:
 | Consumer | All consumer channels | `{hostname}-consumer` |
 
 This isolation means:
+
 - **Flow control** (broker blocking) only affects the publisher — consumers keep processing.
 - **Reconnection** of one side doesn't tear down the other.
 - Each connection has its own monitor goroutine and reconnection loop.
@@ -194,25 +216,75 @@ This means callers don't need to implement retry logic around `Begin()` — it
 handles transient failures internally and only returns when the consumer is
 explicitly disconnected or the context is cancelled.
 
+### Project layout
+
+```
+go-rabbit-go/
+├── doc.go                  # Package overview (root = shared types)
+├── logger.go               # Logger interface + default implementation
+├── errors.go               # ChannelError + sentinel errors (shared)
+├── errors_test.go
+├── amqpx/                  # AMQP interface abstractions
+│   ├── interfaces.go       # AMQPConnection, AMQPChannel, Dialer
+│   ├── adapter.go          # ConnAdapter, DefaultDialer
+│   ├── adapter_test.go
+│   ├── keys.go             # AMQP table key constants
+│   ├── keys_test.go
+│   ├── table.go            # MergeTable helper
+│   └── table_test.go
+├── client/
+│   ├── client.go           # Client, Config, HealthStatus, connection lifecycle
+│   ├── client_test.go
+│   ├── errors.go           # DialError
+│   └── mocks.go            # Test doubles
+├── consumer/
+│   ├── consumer.go         # ConnProvider, Consumer, Delivery, options, retry/DLQ
+│   ├── consumer_test.go
+│   ├── errors.go           # QueueError
+│   └── mocks.go            # Test doubles
+├── publisher/
+│   ├── publisher.go        # ConnProvider, Publisher, ExchangeOption, Message
+│   ├── publisher_test.go
+│   ├── errors.go           # ExchangeError, PublishError
+│   └── mocks.go            # Test doubles
+├── manager/
+│   ├── manager.go          # ConnectionManager, ConnectionConfig
+│   ├── manager_test.go
+│   ├── errors.go           # ConnectionError
+│   └── mocks.go            # Test doubles
+└── internal/
+    ├── conn/               # Managed connection state
+    │   ├── managed.go
+    │   ├── managed_test.go
+    │   └── mocks.go        # Test doubles
+    └── rand/               # Random ID generation
+        ├── rand.go
+        └── rand_test.go
+```
+
+Each sub-package defines its own `ConnProvider` interface describing exactly
+what it needs from the connection owner. The `client` package implements both
+interfaces, keeping packages decoupled and independently testable.
+
 ## Consumers
 
 ### Creating a consumer
 
-Consumers are created via `client.NewConsumer()`. Each consumer gets its own
-AMQP channel, declares its queue (as a quorum queue), sets up retry and dead
-letter infrastructure, and binds to the specified exchange.
+Consumers are created via `consumer.New()`. Each consumer gets its own AMQP
+channel, declares its queue (as a quorum queue), sets up retry and dead letter
+infrastructure, and binds to the specified exchange.
 
 ```go
-consumer, err := client.NewConsumer("my.queue", handler,
-    rabbitmq.WithExchangeName("my-exchange"),
-    rabbitmq.WithRoutingKey([]string{"routing.key.one", "routing.key.two"}),
-    rabbitmq.WithPrefetch(5),
+cons, err := consumer.New(c, "my.queue", handler,
+    consumer.WithExchangeName("my-exchange"),
+    consumer.WithRoutingKey([]string{"routing.key.one", "routing.key.two"}),
+    consumer.WithPrefetch(5),
 )
 if err != nil {
     // handle error
 }
 
-go consumer.Begin()
+wg.Go(func() { cons.Begin() })
 ```
 
 Call `Begin()` in a goroutine — it blocks and continuously processes messages
@@ -237,7 +309,7 @@ s.consumePaymentProcessing()
 Every consumer handler follows the same signature:
 
 ```go
-func handler(d rabbitmq.Delivery, queue string) error
+func handler(d consumer.Delivery, queue string) error
 ```
 
 | Parameter | Description |
@@ -256,15 +328,15 @@ retry strategy.
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `WithExchangeName(name)` | Exchange to bind to | `""` |
-| `WithRoutingKey([]string{...})` | One or more routing keys | `nil` |
-| `WithPrefetch(n)` | Channel prefetch count | `10` |
-| `WithAutoDelete()` | Mark queue as auto-delete | `false` |
-| `WithRetryDisabled()` | Disable retry strategy | enabled |
-| `WithRetryMaxAttempt(n)` | Max retry attempts | `5` |
-| `WithRetryFn(fn)` | Custom delay function | `attempt * 1000` ms |
-| `WithDLQFn(fn)` | Callback before sending to DLQ | `nil` |
-| `WithHeadersBinding(map)` | Headers for headers-exchange binding | `nil` |
+| `consumer.WithExchangeName(name)` | Exchange to bind to | `""` |
+| `consumer.WithRoutingKey([]string{...})` | One or more routing keys | `nil` |
+| `consumer.WithPrefetch(n)` | Channel prefetch count | `10` |
+| `consumer.WithAutoDelete()` | Mark queue as auto-delete | `false` |
+| `consumer.WithRetryDisabled()` | Disable retry strategy | enabled |
+| `consumer.WithRetryMaxAttempt(n)` | Max retry attempts | `5` |
+| `consumer.WithRetryFn(fn)` | Custom delay function | `attempt * 1000` ms |
+| `consumer.WithDLQFn(fn)` | Callback before sending to DLQ | `nil` |
+| `consumer.WithHeadersBinding(map)` | Headers for headers-exchange binding | `nil` |
 
 ## Publishers
 
@@ -273,22 +345,22 @@ retry strategy.
 A publisher is created per client and declares the exchanges it needs:
 
 ```go
-pub, err := client.NewPublisher([]rabbitmq.ExchangeOption{
-    {Name: "orders", Type: rabbitmq.ExchangeTopic},
-    {Name: "notifications", Type: rabbitmq.ExchangeDirect},
+pub, err := publisher.New(c.PublisherConn(), []publisher.ExchangeOption{
+    {Name: "orders", Type: publisher.ExchangeTopic},
+    {Name: "notifications", Type: publisher.ExchangeDirect},
 })
 if err != nil {
     // handle error
 }
 ```
 
-Each client supports a single publisher instance. Calling `NewPublisher()`
-again returns the existing one.
+Each client supports a single publisher instance. The client's `PublisherConn()`
+method returns a connection provider that routes to the publisher connection.
 
 ### Publishing messages
 
 ```go
-err := pub.Publish(rabbitmq.PublishMessage{
+err := pub.Publish(publisher.Message{
     Exchange:   "orders",
     RoutingKey: "order.created",
     Message:    []byte(`{"orderId": "123", "amount": 99.90}`),
@@ -302,7 +374,7 @@ returning. The method blocks until the confirmation is received.
 
 If the connection is blocked or reconnecting, `Publish()` waits up to 25
 seconds before returning an error. If the connection is closing, it returns
-immediately with `errConnClosed`.
+immediately with `ErrConnectionClosed`.
 
 ## Retry Strategy
 
@@ -323,7 +395,7 @@ The delay function receives the delivery, the current attempt number, and the
 error. It returns the delay in milliseconds:
 
 ```go
-rabbitmq.WithRetryFn(func(d rabbitmq.Delivery, attempt int32, err error) int32 {
+consumer.WithRetryFn(func(d consumer.Delivery, attempt int32, err error) int32 {
     // Exponential backoff: 2s, 4s, 8s, 16s, 32s
     return int32(math.Pow(2, float64(attempt))) * 1000
 })
@@ -332,8 +404,8 @@ rabbitmq.WithRetryFn(func(d rabbitmq.Delivery, attempt int32, err error) int32 {
 ### Disabling retries
 
 ```go
-consumer, err := client.NewConsumer("my.queue", handler,
-    rabbitmq.WithRetryDisabled(),
+cons, err := consumer.New(c, "my.queue", handler,
+    consumer.WithRetryDisabled(),
 )
 ```
 
@@ -367,7 +439,7 @@ to `{queue}.dlq` — a quorum queue declared alongside the main queue.
 You can run a callback before the message is sent to the DLQ:
 
 ```go
-rabbitmq.WithDLQFn(func(content string) bool {
+consumer.WithDLQFn(func(content string) bool {
     // Log, alert, or inspect the failed message
     log.Printf("Message failed permanently: %s", content)
 
@@ -403,7 +475,7 @@ The original routing key is accessible via `d.GetRoutingKey()` in the consumer
 handler — it reads from `x-original-routing-key` when available, falling back
 to the message's current routing key.
 
-User-provided headers in `PublishMessage.Headers` are merged with the
+User-provided headers in `Message.Headers` are merged with the
 automatic headers. User headers take precedence if there are conflicts.
 
 ## Health Check
@@ -411,7 +483,7 @@ automatic headers. User headers take precedence if there are conflicts.
 Check the connection status of a client:
 
 ```go
-status := client.CheckHealth()
+status := c.CheckHealth()
 
 fmt.Println(status.Connected)          // true when both connections are up
 fmt.Println(status.PublisherConnected)  // publisher connection status
@@ -420,12 +492,12 @@ fmt.Println(status.Blocked)            // true if the publisher is blocked by th
 fmt.Println(status.Reconnecting)       // true if any reconnection is in progress
 ```
 
-With `ConnectionManager`, get per-connection health:
+With `manager`, get per-connection health:
 
 ```go
 allStatus := cm.CheckHealth()
-// map["default"]  → HealthStatus{Connected: true, ...}
-// map["payments"] → HealthStatus{Connected: true, ...}
+// map["default"]  → client.HealthStatus{Connected: true, ...}
+// map["payments"] → client.HealthStatus{Connected: true, ...}
 ```
 
 ## Graceful Shutdown
@@ -443,18 +515,20 @@ the context is cancelled, the client:
 ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 defer stop()
 
-client, wg := rabbitmq.New(ctx, config)
-client.Connect()
+c, wg := client.New(ctx, client.Config{
+    URI: "amqp://guest:guest@localhost:5672/",
+})
+c.Connect()
 
 // ... set up consumers and publisher ...
 
 wg.Wait() // blocks until shutdown is complete
 ```
 
-With `ConnectionManager`:
+With `manager`:
 
 ```go
-cm, _ := rabbitmq.NewConnectionManager(ctx, configs)
+cm := manager.New(ctx, configs)
 cm.ConnectAll()
 
 // ... set up consumers and publishers ...
@@ -465,21 +539,60 @@ cm.Wait() // blocks until all connections are shut down
 You can also trigger a manual disconnect:
 
 ```go
-client.Disconnect()
+c.Disconnect()
 // or
 cm.Disconnect()
 ```
 
 ## Exchange Types
 
-Convenience constants for exchange types:
+Convenience constants for exchange types (in the `publisher` package):
 
 ```go
-rabbitmq.ExchangeDirect  // "direct"
-rabbitmq.ExchangeTopic   // "topic"
-rabbitmq.ExchangeFanout  // "fanout"
-rabbitmq.ExchangeHeader  // "header"
+publisher.ExchangeDirect  // "direct"
+publisher.ExchangeTopic   // "topic"
+publisher.ExchangeFanout  // "fanout"
+publisher.ExchangeHeader  // "header"
 ```
+
+## Custom Logger
+
+By default the library logs to stdout with `[INFO]`/`[ERROR]` prefixes.
+Provide a custom logger via `Config.Logger`:
+
+```go
+type Logger interface {
+    Info(msg string, args ...any)
+    Error(msg string, args ...any)
+}
+```
+
+```go
+c, wg := client.New(ctx, client.Config{
+    URI:    "amqp://localhost/",
+    Logger: myZapLogger,
+})
+```
+
+Use `rabbitmq.NewDefaultLogger()` to get the built-in logger if needed.
+
+## Error Types
+
+Each package defines domain-specific error types:
+
+| Package | Error | Description |
+|---------|-------|-------------|
+| `rabbitmq` | `ChannelError` | AMQP channel failure (shared) |
+| `rabbitmq` | `ErrConnectionClosed` | Connection is closing (sentinel) |
+| `rabbitmq` | `ErrConnectionBlocked` | Publisher blocked by broker (sentinel) |
+| `rabbitmq` | `ErrMaxReconnectAttempts` | Reconnection attempts exhausted (sentinel) |
+| `client` | `DialError` | AMQP dial failure |
+| `consumer` | `QueueError` | Queue declaration/binding failure |
+| `publisher` | `ExchangeError` | Exchange declaration failure |
+| `publisher` | `PublishError` | Message publish/confirmation failure |
+| `manager` | `ConnectionError` | Named connection failure |
+
+All error types implement `Unwrap()` for use with `errors.Is()` and `errors.As()`.
 
 ## License
 
