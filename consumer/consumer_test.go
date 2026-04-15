@@ -345,7 +345,7 @@ func TestDeadletter_CallbackReturnsFalse_AcksMessage(t *testing.T) {
 	ch := &mockAMQPChannel{}
 	conn := &mockConnProvider{}
 	c := newTestConsumer(ch, conn)
-	c.params.DeadletterStrategy.CallbackFn = func(body string) bool {
+	c.params.DeadletterStrategy.CallbackFn = func(body Delivery) bool {
 		return false
 	}
 
@@ -368,7 +368,7 @@ func TestDeadletter_CallbackPanics_Nacks(t *testing.T) {
 	ch := &mockAMQPChannel{}
 	conn := &mockConnProvider{}
 	c := newTestConsumer(ch, conn)
-	c.params.DeadletterStrategy.CallbackFn = func(body string) bool {
+	c.params.DeadletterStrategy.CallbackFn = func(body Delivery) bool {
 		panic("callback panic")
 	}
 
@@ -543,8 +543,8 @@ func TestFunctionalOptions(t *testing.T) {
 
 	// WithDLQFn
 	dlqCalled := false
-	WithDLQFn(func(s string) bool { dlqCalled = true; return true })(c)
-	c.params.DeadletterStrategy.CallbackFn("test")
+	WithDLQFn(func(Delivery) bool { dlqCalled = true; return true })(c)
+	c.params.DeadletterStrategy.CallbackFn(Delivery{})
 	if !dlqCalled {
 		t.Fatal("expected DLQ callback to be set and called")
 	}

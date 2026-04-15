@@ -105,7 +105,7 @@ type Deadletter struct {
 	DLQueueName string
 	// CallbackFn is called before sending the message to the DLQ.
 	// Return true to send to DLQ (nack), false to acknowledge and drop.
-	CallbackFn func(string) bool
+	CallbackFn func(Delivery) bool
 }
 
 // Options holds all configuration for a [Consumer].
@@ -191,7 +191,7 @@ func WithRetryFn(fn func(d Delivery, attempt int32, err error) int32) Option {
 
 // WithDLQFn provides a callback that is invoked before sending a
 // message to the dead letter queue.
-func WithDLQFn(fn func(string) bool) Option {
+func WithDLQFn(fn func(Delivery) bool) Option {
 	return func(c *Consumer) { c.params.DeadletterStrategy.CallbackFn = fn }
 }
 
@@ -438,7 +438,7 @@ func (c *Consumer) sendToDeadletter(d Delivery) {
 	}()
 
 	sendToDLQ := c.params.DeadletterStrategy.CallbackFn == nil ||
-		c.params.DeadletterStrategy.CallbackFn(string(d.Body))
+		c.params.DeadletterStrategy.CallbackFn(d)
 
 	if sendToDLQ {
 		if err := d.Nack(false, false); err != nil {
