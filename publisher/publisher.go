@@ -65,11 +65,12 @@ type ExchangeOption struct {
 
 // Message is the payload passed to [Publisher.Publish].
 type Message struct {
-	Exchange    string
-	RoutingKey  string
-	Message     []byte
-	ContentType string
-	Headers     map[string]any
+	Exchange      string
+	RoutingKey    string
+	Message       []byte
+	ContentType   string
+	Headers       map[string]any
+	CorrelationId string
 }
 
 // Publisher publishes messages to the broker through a single AMQP
@@ -195,13 +196,13 @@ func (p *Publisher) reconnect() {
 	p.isReconnecting = true
 	p.reconnectAttempt++
 	reconnSleep := reconnectBase * time.Duration(p.reconnectAttempt)
-	p.conn.Logger().Info("reconnecting publisher channel in %.0fs: %d of %d attempts",
-		reconnSleep.Seconds(), p.reconnectAttempt, maxReconnect)
+	p.conn.Logger().Info(fmt.Sprintf("reconnecting publisher channel in %.0fs: %d of %d attempts",
+		reconnSleep.Seconds(), p.reconnectAttempt, maxReconnect))
 	time.Sleep(reconnSleep)
 
 	if p.ch != nil {
 		if err := p.ch.Close(); err != nil {
-			p.conn.Logger().Error("close old publisher channel: %v", err)
+			p.conn.Logger().Error(fmt.Sprintf("close old publisher channel: %v", err))
 		}
 	}
 
@@ -267,8 +268,9 @@ func (p *Publisher) publishWithConfirmation(msg Message) error {
 		false,
 		false,
 		amqp.Publishing{
-			ContentType: msg.ContentType,
-			Body:        msg.Message,
+			ContentType:   msg.ContentType,
+			CorrelationId: msg.CorrelationId,
+			Body:          msg.Message,
 			Headers: amqpx.MergeTable(amqp.Table{
 				amqpx.KeyOriginalExchange: msg.Exchange,
 				amqpx.KeyOriginalRouteKey: msg.RoutingKey,
@@ -291,9 +293,10 @@ func (p *Publisher) publishWithoutConfirmation(msg Message) error {
 	defer cancel()
 
 	return p.ch.PublishWithContext(ctx, msg.Exchange, msg.RoutingKey, false, false, amqp.Publishing{
-		ContentType:  DefaultContentType,
-		Body:         msg.Message,
-		DeliveryMode: amqp.Persistent,
+		ContentType:   DefaultContentType,
+		CorrelationId: msg.CorrelationId,
+		Body:          msg.Message,
+		DeliveryMode:  amqp.Persistent,
 		Headers: amqpx.MergeTable(amqp.Table{
 			amqpx.KeyOriginalExchange: msg.Exchange,
 			amqpx.KeyOriginalRouteKey: msg.RoutingKey,
@@ -308,26 +311,39 @@ func (p *Publisher) inspect(msg Message, elapsed time.Duration, err error) {
 	title := fmt.Sprintf("[AMQP] [PUBLISH] [%s] [%s]",
 		msg.Exchange, msg.RoutingKey)
 
-	ms := elapsed.Milliseconds()
+	data := map[string]any{
+		"type":          "publisher",
+		"duration":      elapsed.Milliseconds(),
+		"correlationId": msg.CorrelationId,
+		"binding": map[string]any{
+			"exchange":   msg.Exchange,
+			"routingKey": msg.RoutingKey,
+		},
+		"publishedMessage": map[string]any{
+			"content": string(msg.Message),
+			"headers": msg.Headers,
+		},
+	}
 
 	if err != nil {
-		p.conn.Logger().Error("%s | duration=%d error=%v", title, ms, err)
+		data["error"] = err.Error()
+		p.conn.Logger().Error(title, data)
 		return
 	}
 
-	p.conn.Logger().Info("%s | duration=%d", title, ms)
+	p.conn.Logger().Info(title, data)
 }
 
 func (p *Publisher) monitorChannel() {
 	for err := range p.notifyChanClose {
 		if err != nil && !err.Recover {
-			p.conn.Logger().Error("shutting down publisher channel permanently: %s", err.Reason)
+			p.conn.Logger().Error(fmt.Sprintf("shutting down publisher channel permanently: %s", err.Reason))
 			p.isConnected = false
 			return
 		}
 
 		if err != nil {
-			p.conn.Logger().Error("publisher channel closed: %s (recoverable: %t)", err.Reason, err.Recover)
+			p.conn.Logger().Error(fmt.Sprintf("publisher channel closed: %s (recoverable: %t)", err.Reason, err.Recover))
 		}
 		p.reconnect()
 	}

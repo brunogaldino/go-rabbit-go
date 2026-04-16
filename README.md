@@ -365,10 +365,11 @@ method returns a connection provider that routes to the publisher connection.
 
 ```go
 err := pub.Publish(publisher.Message{
-    Exchange:   "orders",
-    RoutingKey: "order.created",
-    Message:    []byte(`{"orderId": "123", "amount": 99.90}`),
-    Headers:    map[string]any{"x-custom": "value"},
+    Exchange:      "orders",
+    RoutingKey:    "order.created",
+    Message:       []byte(`{"orderId": "123", "amount": 99.90}`),
+    Headers:       map[string]any{"x-custom": "value"},
+    CorrelationId: "abc-123",
 })
 ```
 
@@ -568,16 +569,42 @@ Provide a custom logger via `Config.Logger`:
 
 ```go
 type Logger interface {
-    Info(msg string, args ...any)
-    Error(msg string, args ...any)
+    Info(msg string, data ...map[string]any)
+    Error(msg string, data ...map[string]any)
 }
 ```
+
+Operational logs (reconnections, channel errors, etc.) pass only `msg` with no
+data map. Inspection logs pass a title string plus a structured `map[string]any`
+containing message metadata — see [Inspection Logging](#inspection-logging).
 
 ```go
 c, wg := client.New(ctx, client.Config{
     URI:    "amqp://localhost/",
     Logger: myZapLogger,
 })
+```
+
+**Example adapter** (zerolog):
+
+```go
+type zerologAdapter struct{ log zerolog.Logger }
+
+func (z *zerologAdapter) Info(msg string, data ...map[string]any) {
+    e := z.log.Info()
+    if len(data) > 0 {
+        e = e.Fields(data[0])
+    }
+    e.Msg(msg)
+}
+
+func (z *zerologAdapter) Error(msg string, data ...map[string]any) {
+    e := z.log.Error()
+    if len(data) > 0 {
+        e = e.Fields(data[0])
+    }
+    e.Msg(msg)
+}
 ```
 
 Use `rabbitmq.NewDefaultLogger()` to get the built-in logger if needed.
@@ -624,34 +651,49 @@ The env var takes precedence over `Config.LogType` when set.
 **Errors are always logged** regardless of the `LogType` setting. Successful
 operations are only logged when the matching category is enabled.
 
-**Consumer inspection** logs after each message is processed:
+Inspection logs call `Logger.Info()` (or `Logger.Error()`) with a title string
+and a structured `map[string]any`. Your logger decides the output format.
+
+**Consumer inspection** — logged after each message is processed:
 
 ```
-[AMQP] [CONSUMER] [my-exchange] [order.created] [orders.process]
-  duration:      12
-  correlationId: abc-123
-  isDead:        false
-  message:       {"orderId": "123"}
+title: "[AMQP] [CONSUMER] [my-exchange] [order.created] [orders.process]"
+data:  map[string]any{
+    "type":          "consumer",
+    "duration":      12,                  // milliseconds
+    "correlationId": "abc-123",
+    "binding": map[string]any{
+        "exchange":   "my-exchange",
+        "routingKey": "order.created",
+        "queue":      "orders.process",
+    },
+    "isDead": false,
+    "consumedMessage": map[string]any{
+        "content": `{"orderId": "123"}`,
+        "headers": map[string]any{ ... },
+    },
+    // "error": "connection timeout"      // only present on failure
+}
 ```
 
-When the handler returns an error:
+**Publisher inspection** — logged after each publish:
 
 ```
-[AMQP] [CONSUMER] [my-exchange] [order.created] [orders.process]
-  duration:      5
-  correlationId: abc-123
-  isDead:        false
-  message:       {"orderId": "123"}
-  error:         connection timeout
-```
-
-**Publisher inspection** logs after each publish:
-
-```
-[AMQP] [PUBLISH] [orders] [order.created]
-  duration:      1
-  correlationId: abc-123
-  message:       {"orderId": "123"}
+title: "[AMQP] [PUBLISH] [orders] [order.created]"
+data:  map[string]any{
+    "type":          "publisher",
+    "duration":      1,                   // milliseconds
+    "correlationId": "abc-123",
+    "binding": map[string]any{
+        "exchange":   "orders",
+        "routingKey": "order.created",
+    },
+    "publishedMessage": map[string]any{
+        "content": `{"orderId": "123"}`,
+        "headers": map[string]any{ ... },
+    },
+    // "error": "nack for delivery tag 5" // only present on failure
+}
 ```
 
 The `isDead` field in consumer logs indicates whether the message was sent to

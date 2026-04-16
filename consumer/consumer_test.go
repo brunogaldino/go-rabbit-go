@@ -594,7 +594,7 @@ func TestConsume_ConsumeError(t *testing.T) {
 	conn := &mockConnProvider{
 		loggerFn: func() rabbitmq.Logger {
 			return &mockLogger{
-				errorFn: func(msg string, args ...any) {
+				errorFn: func(msg string, data ...map[string]any) {
 					logged = true
 				},
 			}

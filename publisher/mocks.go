@@ -206,18 +206,18 @@ func (m *mockAMQPChannel) IsClosed() bool {
 
 // mockLogger implements rabbitmq.Logger for testing.
 type mockLogger struct {
-	InfoFn  func(msg string, args ...any)
-	ErrorFn func(msg string, args ...any)
+	InfoFn  func(msg string, data ...map[string]any)
+	ErrorFn func(msg string, data ...map[string]any)
 }
 
-func (m *mockLogger) Info(msg string, args ...any) {
+func (m *mockLogger) Info(msg string, data ...map[string]any) {
 	if m.InfoFn != nil {
-		m.InfoFn(msg, args...)
+		m.InfoFn(msg, data...)
 	}
 }
 
-func (m *mockLogger) Error(msg string, args ...any) {
+func (m *mockLogger) Error(msg string, data ...map[string]any) {
 	if m.ErrorFn != nil {
-		m.ErrorFn(msg, args...)
+		m.ErrorFn(msg, data...)
 	}
 }

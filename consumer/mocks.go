@@ -251,18 +251,18 @@ func (m *mockAcknowledger) Reject(tag uint64, requeue bool) error {
 // --- mockLogger ---
 
 type mockLogger struct {
-	infoFn  func(string, ...any)
-	errorFn func(string, ...any)
+	infoFn  func(string, ...map[string]any)
+	errorFn func(string, ...map[string]any)
 }
 
-func (m *mockLogger) Info(msg string, args ...any) {
+func (m *mockLogger) Info(msg string, data ...map[string]any) {
 	if m.infoFn != nil {
-		m.infoFn(msg, args...)
+		m.infoFn(msg, data...)
 	}
 }
 
-func (m *mockLogger) Error(msg string, args ...any) {
+func (m *mockLogger) Error(msg string, data ...map[string]any) {
 	if m.errorFn != nil {
-		m.errorFn(msg, args...)
+		m.errorFn(msg, data...)
 	}
 }

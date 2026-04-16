@@ -306,7 +306,7 @@ func (c *Consumer) setOptions(queue string, callback Handler, options []Option) 
 // cancelled. It automatically reconnects on channel or connection drops.
 func (c *Consumer) Begin(groups ...string) error {
 	for {
-		c.conn.Logger().Info("beginning message consumer %s", c.params.Queue)
+		c.conn.Logger().Info(fmt.Sprintf("beginning message consumer %s", c.params.Queue))
 		c.consume()
 		c.wg.Wait()
 
@@ -314,14 +314,14 @@ func (c *Consumer) Begin(groups ...string) error {
 			return nil
 		}
 
-		c.conn.Logger().Info("consumer %s channel closed, waiting for reconnection...", c.params.Queue)
+		c.conn.Logger().Info(fmt.Sprintf("consumer %s channel closed, waiting for reconnection...", c.params.Queue))
 
 		if !c.waitForReconnect() {
 			return nil
 		}
 
 		if err := c.setup(); err != nil {
-			c.conn.Logger().Error("failed to reattach consumer %s: %v", c.params.Queue, err)
+			c.conn.Logger().Error(fmt.Sprintf("failed to reattach consumer %s: %v", c.params.Queue, err))
 			time.Sleep(setupRetryDelay)
 		}
 	}
@@ -341,7 +341,7 @@ func (c *Consumer) waitForReconnect() bool {
 func (c *Consumer) consume() {
 	msgs, err := c.channel.Consume(c.params.Queue, c.consumerName, false, false, false, false, nil)
 	if err != nil {
-		c.conn.Logger().Error("error beginning consumer %s: %v", c.params.Queue, err)
+		c.conn.Logger().Error(fmt.Sprintf("error beginning consumer %s: %v", c.params.Queue, err))
 		return
 	}
 
@@ -367,7 +367,7 @@ func (c *Consumer) processDelivery(d Delivery) {
 
 	defer func() {
 		if r := recover(); r != nil {
-			c.conn.Logger().Error("recovered from panic in consumer: %v", r)
+			c.conn.Logger().Error(fmt.Sprintf("recovered from panic in consumer: %v", r))
 			handlerErr = fmt.Errorf("panic: %v", r)
 		}
 
@@ -375,7 +375,7 @@ func (c *Consumer) processDelivery(d Delivery) {
 			retried = c.retry(d, handlerErr)
 		} else {
 			if err := d.delivery.Ack(false); err != nil {
-				c.conn.Logger().Error("could not ack message: %v", err)
+				c.conn.Logger().Error(fmt.Sprintf("could not ack message: %v", err))
 			}
 		}
 
@@ -392,15 +392,15 @@ func (c *Consumer) processDelivery(d Delivery) {
 // closes the AMQP channel, and unregisters the consumer from the client.
 func (c *Consumer) Disconnect() {
 	c.closing.Store(true)
-	c.conn.Logger().Info("stopping deliveries to consumer %s", c.consumerName)
+	c.conn.Logger().Info(fmt.Sprintf("stopping deliveries to consumer %s", c.consumerName))
 
 	if err := c.channel.Cancel(c.consumerName, false); err != nil {
-		c.conn.Logger().Error("cancel consumer %s: %v", c.consumerName, err)
+		c.conn.Logger().Error(fmt.Sprintf("cancel consumer %s: %v", c.consumerName, err))
 	}
 	c.wg.Wait()
 
 	if err := c.channel.Close(); err != nil {
-		c.conn.Logger().Error("close consumer channel %s [RK: %s]: %v", c.params.Queue, c.params.RoutingKey, err)
+		c.conn.Logger().Error(fmt.Sprintf("close consumer channel %s [RK: %s]: %v", c.params.Queue, c.params.RoutingKey, err))
 	}
 
 	c.conn.UnregisterConsumer(c.consumerName)
@@ -438,13 +438,13 @@ func (c *Consumer) publishRetry(d Delivery, retryCount int32, delayAmount int32,
 	})
 
 	if pubErr != nil {
-		c.conn.Logger().Error("failed to publish retry: %v", pubErr)
+		c.conn.Logger().Error(fmt.Sprintf("failed to publish retry: %v", pubErr))
 		d.delivery.Nack(false, false)
 		return
 	}
 
 	if ackErr := d.delivery.Ack(false); ackErr != nil {
-		c.conn.Logger().Error("failed to ack original - retry: %v", ackErr)
+		c.conn.Logger().Error(fmt.Sprintf("failed to ack original - retry: %v", ackErr))
 	}
 }
 
@@ -452,7 +452,7 @@ func (c *Consumer) deadletter(d Delivery) {
 	if !c.params.DeadletterStrategy.Enabled {
 		c.conn.Logger().Info("dlq strategy disabled, acking message")
 		if err := d.delivery.Ack(false); err != nil {
-			c.conn.Logger().Error("failed to ack (dlq disabled): %v", err)
+			c.conn.Logger().Error(fmt.Sprintf("failed to ack (dlq disabled): %v", err))
 		}
 		return
 	}
@@ -463,7 +463,7 @@ func (c *Consumer) deadletter(d Delivery) {
 func (c *Consumer) sendToDeadletter(d Delivery) {
 	defer func() {
 		if r := recover(); r != nil {
-			c.conn.Logger().Error("panic in DLQ callback, forcing nack: %v", r)
+			c.conn.Logger().Error(fmt.Sprintf("panic in DLQ callback, forcing nack: %v", r))
 			d.delivery.Nack(false, false)
 		}
 	}()
@@ -473,13 +473,13 @@ func (c *Consumer) sendToDeadletter(d Delivery) {
 
 	if sendToDLQ {
 		if err := d.delivery.Nack(false, false); err != nil {
-			c.conn.Logger().Error("failed to nack - deadletter: %v", err)
+			c.conn.Logger().Error(fmt.Sprintf("failed to nack - deadletter: %v", err))
 		}
 		return
 	}
 
 	if err := d.delivery.Ack(false); err != nil {
-		c.conn.Logger().Error("failed to ack - deadletter: %v", err)
+		c.conn.Logger().Error(fmt.Sprintf("failed to ack - deadletter: %v", err))
 	}
 }
 
@@ -489,15 +489,29 @@ func (c *Consumer) inspect(d Delivery, elapsed time.Duration, err error, isDead 
 	title := fmt.Sprintf("[AMQP] [CONSUMER] [%s] [%s] [%s]",
 		c.params.ExchangeName, d.RoutingKey, c.params.Queue)
 
-	ms := elapsed.Milliseconds()
+	data := map[string]any{
+		"type":          "consumer",
+		"duration":      elapsed.Milliseconds(),
+		"correlationId": d.CorrelationId,
+		"binding": map[string]any{
+			"exchange":   c.params.ExchangeName,
+			"routingKey": d.RoutingKey,
+			"queue":      c.params.Queue,
+		},
+		"isDead": isDead,
+		"consumedMessage": map[string]any{
+			"content": string(d.Body),
+			"headers": d.Headers,
+		},
+	}
 
 	if err != nil {
-		c.conn.Logger().Error("%s | duration=%d isDead=%t error=%v",
-			title, ms, isDead, err)
+		data["error"] = err.Error()
+		c.conn.Logger().Error(title, data)
 		return
 	}
 
-	c.conn.Logger().Info("%s | duration=%d", title, ms)
+	c.conn.Logger().Info(title, data)
 }
 
 // --- Queue declarations ---

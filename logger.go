@@ -1,6 +1,9 @@
 package rabbitmq
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+)
 
 // LogType controls which inspection logs are emitted.
 // Use [LogTypeNone] (the default) to suppress inspection output, or
@@ -31,17 +34,42 @@ func (lt LogType) Includes(category LogType) bool {
 // Provide a custom implementation via [Config].Logger to integrate
 // with your application's logging framework. When nil, a default
 // logger that writes to stdout is used.
+//
+// The optional data parameter carries structured metadata for
+// inspection logs (consumed/published message details). Operational
+// logs (reconnection, channel errors) pass only the msg string.
 type Logger interface {
-	// Info logs an informational message with optional format arguments.
-	Info(msg string, args ...any)
-	// Error logs an error message with optional format arguments.
-	Error(msg string, args ...any)
+	// Info logs an informational message with optional structured data.
+	Info(msg string, data ...map[string]any)
+	// Error logs an error message with optional structured data.
+	Error(msg string, data ...map[string]any)
 }
 
 type defaultLogger struct{}
 
-func (l *defaultLogger) Info(msg string, args ...any)  { fmt.Printf("[INFO] "+msg+"\n", args...) }
-func (l *defaultLogger) Error(msg string, args ...any) { fmt.Printf("[ERROR] "+msg+"\n", args...) }
+func (l *defaultLogger) Info(msg string, data ...map[string]any) {
+	l.log("info", msg, data...)
+}
+
+func (l *defaultLogger) Error(msg string, data ...map[string]any) {
+	l.log("error", msg, data...)
+}
+
+func (l *defaultLogger) log(level, msg string, data ...map[string]any) {
+	if len(data) > 0 {
+		entry := make(map[string]any, len(data[0])+2)
+		entry["level"] = level
+		entry["title"] = msg
+		for k, v := range data[0] {
+			entry[k] = v
+		}
+		j, _ := json.Marshal(entry)
+		fmt.Println(string(j))
+		return
+	}
+
+	fmt.Printf("[%s] %s\n", level, msg)
+}
 
 // NewDefaultLogger returns a [Logger] that writes to stdout with
 // [INFO] / [ERROR] prefixes. It is used when no custom logger is

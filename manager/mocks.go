@@ -78,7 +78,7 @@ type mockLogger struct {
 	disabled bool
 }
 
-func (l *mockLogger) Info(msg string, args ...any) {
+func (l *mockLogger) Info(msg string, data ...map[string]any) {
 	if l.disabled {
 		return
 	}
@@ -87,7 +87,7 @@ func (l *mockLogger) Info(msg string, args ...any) {
 	l.infos = append(l.infos, msg)
 }
 
-func (l *mockLogger) Error(msg string, args ...any) {
+func (l *mockLogger) Error(msg string, data ...map[string]any) {
 	if l.disabled {
 		return
 	}

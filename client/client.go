@@ -259,7 +259,7 @@ func (c *Client) reconnectPublisher() {
 	}
 
 	if err := c.publisherCh.Connect(); err != nil {
-		c.logger.Error("failed to reconnect publisher channel: %v", err)
+		c.logger.Error(fmt.Sprintf("failed to reconnect publisher channel: %v", err))
 	}
 }
 
@@ -295,7 +295,7 @@ func (c *Client) monitorPublisherConn() {
 		case blocking := <-c.pubNotifyBlock:
 			c.isBlocked.Store(blocking.Active)
 			if blocking.Active {
-				c.logger.Info("publisher connection BLOCKED, reason: %s", blocking.Reason)
+				c.logger.Info(fmt.Sprintf("publisher connection BLOCKED, reason: %s", blocking.Reason))
 				continue
 			}
 			c.logger.Info("publisher connection UNBLOCKED")
@@ -303,7 +303,7 @@ func (c *Client) monitorPublisherConn() {
 		case err := <-c.pub.NotifyError:
 			if err != nil && !err.Recover {
 				c.pub.MarkDisconnected()
-				c.logger.Error("shutting down publisher connection permanently: %v", err)
+				c.logger.Error(fmt.Sprintf("shutting down publisher connection permanently: %v", err))
 				return
 			}
 
@@ -328,7 +328,7 @@ func (c *Client) monitorConsumerConn() {
 		case err := <-c.con.NotifyError:
 			if err != nil && !err.Recover {
 				c.con.MarkDisconnected()
-				c.logger.Error("shutting down consumer connection permanently: %v", err)
+				c.logger.Error(fmt.Sprintf("shutting down consumer connection permanently: %v", err))
 				return
 			}
 
@@ -365,7 +365,7 @@ func (c *Client) Disconnect() {
 	c.mu.Unlock()
 
 	if len(consumers) > 0 {
-		c.logger.Info("terminating all consumers: %d", len(consumers))
+		c.logger.Info(fmt.Sprintf("terminating all consumers: %d", len(consumers)))
 		var wg sync.WaitGroup
 		for _, cons := range consumers {
 			wg.Go(func() {
