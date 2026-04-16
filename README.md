@@ -36,6 +36,10 @@ queues, dead letter handling, and publisher confirms out of the box.
 - [Graceful Shutdown](#graceful-shutdown)
 - [Exchange Types](#exchange-types)
 - [Custom Logger](#custom-logger)
+- [Inspection Logging](#inspection-logging)
+  - [Log types](#log-types)
+  - [Environment variable](#environment-variable)
+  - [What gets logged](#what-gets-logged)
 - [Error Types](#error-types)
 - [License](#license)
 
@@ -575,6 +579,81 @@ c, wg := client.New(ctx, client.Config{
 ```
 
 Use `rabbitmq.NewDefaultLogger()` to get the built-in logger if needed.
+
+## Inspection Logging
+
+The library can emit structured logs for every consumed and published message,
+useful for debugging message flows and monitoring performance. This is disabled
+by default and must be explicitly enabled.
+
+### Log types
+
+Control which operations are logged via `Config.LogType`:
+
+```go
+import rabbitmq "github.com/brunogaldino/go-rabbit-go"
+
+c, wg := client.New(ctx, client.Config{
+    URI:     "amqp://localhost/",
+    LogType: rabbitmq.LogTypeAll,
+})
+```
+
+| Value | Constant | Description |
+|-------|----------|-------------|
+| `"none"` | `rabbitmq.LogTypeNone` | No inspection logs (default) |
+| `"consumer"` | `rabbitmq.LogTypeConsumer` | Log consumed messages |
+| `"publisher"` | `rabbitmq.LogTypePublisher` | Log published messages |
+| `"all"` | `rabbitmq.LogTypeAll` | Log both consumed and published messages |
+
+### Environment variable
+
+Set `GORABBIT_LOG_TYPE` to override the `Config.LogType` value without code
+changes. This is resolved once at client creation:
+
+```shell
+GORABBIT_LOG_TYPE=all ./my-service
+```
+
+The env var takes precedence over `Config.LogType` when set.
+
+### What gets logged
+
+**Errors are always logged** regardless of the `LogType` setting. Successful
+operations are only logged when the matching category is enabled.
+
+**Consumer inspection** logs after each message is processed:
+
+```
+[AMQP] [CONSUMER] [my-exchange] [order.created] [orders.process]
+  duration:      12
+  correlationId: abc-123
+  isDead:        false
+  message:       {"orderId": "123"}
+```
+
+When the handler returns an error:
+
+```
+[AMQP] [CONSUMER] [my-exchange] [order.created] [orders.process]
+  duration:      5
+  correlationId: abc-123
+  isDead:        false
+  message:       {"orderId": "123"}
+  error:         connection timeout
+```
+
+**Publisher inspection** logs after each publish:
+
+```
+[AMQP] [PUBLISH] [orders] [order.created]
+  duration:      1
+  correlationId: abc-123
+  message:       {"orderId": "123"}
+```
+
+The `isDead` field in consumer logs indicates whether the message was sent to
+the dead letter queue (all retries exhausted and no further retry was possible).
 
 ## Error Types
 

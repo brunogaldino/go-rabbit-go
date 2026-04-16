@@ -17,6 +17,7 @@ type mockConnProvider struct {
 	closingFn            func() bool
 	hostFn               func() string
 	loggerFn             func() rabbitmq.Logger
+	logTypeFn            func() rabbitmq.LogType
 	registerConsumerFn   func(string, *Consumer)
 	unregisterConsumerFn func(string)
 }
@@ -59,6 +60,14 @@ func (m *mockConnProvider) Logger() rabbitmq.Logger {
 	}
 
 	return &mockLogger{}
+}
+
+func (m *mockConnProvider) LogType() rabbitmq.LogType {
+	if m.logTypeFn != nil {
+		return m.logTypeFn()
+	}
+
+	return rabbitmq.LogTypeNone
 }
 
 func (m *mockConnProvider) RegisterConsumer(name string, c *Consumer) {

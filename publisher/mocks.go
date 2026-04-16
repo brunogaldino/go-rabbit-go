@@ -16,6 +16,7 @@ type mockConnProvider struct {
 	ReconnectingFn func() bool
 	ClosingFn      func() bool
 	LoggerFn       func() rabbitmq.Logger
+	LogTypeFn      func() rabbitmq.LogType
 	SetPublisherFn func(p *Publisher)
 }
 
@@ -57,6 +58,14 @@ func (m *mockConnProvider) Logger() rabbitmq.Logger {
 	}
 
 	return &mockLogger{}
+}
+
+func (m *mockConnProvider) LogType() rabbitmq.LogType {
+	if m.LogTypeFn != nil {
+		return m.LogTypeFn()
+	}
+
+	return rabbitmq.LogTypeNone
 }
 
 func (m *mockConnProvider) SetPublisher(p *Publisher) {

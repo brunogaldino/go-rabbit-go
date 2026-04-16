@@ -42,17 +42,21 @@ type Config struct {
 	// Dialer overrides the AMQP dial function. Used for testing.
 	// When nil, the default amqp091-go dialer is used.
 	Dialer amqpx.Dialer
+	// LogType controls which inspection logs (consumer/publisher/all/none)
+	// are emitted. The env var GORABBIT_LOG_TYPE overrides this value.
+	LogType rabbitmq.LogType
 }
 
 // Client manages two independent AMQP connections (one for publishing,
 // one for consuming) and coordinates their lifecycle, reconnection, and
 // graceful shutdown.
 type Client struct {
-	conf   Config
-	ctx    context.Context
-	wg     *sync.WaitGroup
-	dialer amqpx.Dialer
-	logger rabbitmq.Logger
+	conf    Config
+	ctx     context.Context
+	wg      *sync.WaitGroup
+	dialer  amqpx.Dialer
+	logger  rabbitmq.Logger
+	logType rabbitmq.LogType
 
 	pub            conn.Managed
 	con            conn.Managed
@@ -91,6 +95,14 @@ func New(ctx context.Context, config Config) (*Client, *sync.WaitGroup) {
 		dialer = &amqpx.DefaultDialer{}
 	}
 
+	logType := config.LogType
+	if envVal := os.Getenv("GORABBIT_LOG_TYPE"); envVal != "" {
+		logType = rabbitmq.LogType(envVal)
+	}
+	if logType == "" {
+		logType = rabbitmq.LogTypeNone
+	}
+
 	var wg sync.WaitGroup
 	return &Client{
 		conf:        config,
@@ -98,6 +110,7 @@ func New(ctx context.Context, config Config) (*Client, *sync.WaitGroup) {
 		wg:          &wg,
 		dialer:      dialer,
 		logger:      logger,
+		logType:     logType,
 		consumerMap: map[string]*consumer.Consumer{},
 		hostname:    host,
 	}, &wg
@@ -109,10 +122,11 @@ func (c *Client) Channel() (amqpx.AMQPChannel, error) {
 	return c.con.Conn.Channel()
 }
 
-func (c *Client) Connected() bool         { return c.con.IsConnected.Load() }
-func (c *Client) Closing() bool           { return c.isClosing.Load() }
-func (c *Client) Host() string            { return c.hostname }
-func (c *Client) Logger() rabbitmq.Logger { return c.logger }
+func (c *Client) Connected() bool             { return c.con.IsConnected.Load() }
+func (c *Client) Closing() bool               { return c.isClosing.Load() }
+func (c *Client) Host() string                { return c.hostname }
+func (c *Client) Logger() rabbitmq.Logger     { return c.logger }
+func (c *Client) LogType() rabbitmq.LogType   { return c.logType }
 
 func (c *Client) RegisterConsumer(name string, cons *consumer.Consumer) {
 	c.mu.Lock()
@@ -134,10 +148,11 @@ type publisherConn struct{ c *Client }
 func (a *publisherConn) Channel() (amqpx.AMQPChannel, error) {
 	return a.c.pub.Conn.Channel()
 }
-func (a *publisherConn) Blocked() bool           { return a.c.isBlocked.Load() }
-func (a *publisherConn) Reconnecting() bool      { return a.c.pub.IsReconnecting.Load() }
-func (a *publisherConn) Closing() bool           { return a.c.isClosing.Load() }
-func (a *publisherConn) Logger() rabbitmq.Logger { return a.c.logger }
+func (a *publisherConn) Blocked() bool             { return a.c.isBlocked.Load() }
+func (a *publisherConn) Reconnecting() bool        { return a.c.pub.IsReconnecting.Load() }
+func (a *publisherConn) Closing() bool             { return a.c.isClosing.Load() }
+func (a *publisherConn) Logger() rabbitmq.Logger   { return a.c.logger }
+func (a *publisherConn) LogType() rabbitmq.LogType { return a.c.logType }
 func (a *publisherConn) SetPublisher(p *publisher.Publisher) {
 	a.c.mu.Lock()
 	a.c.publisherCh = p

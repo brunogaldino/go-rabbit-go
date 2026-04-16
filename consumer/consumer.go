@@ -58,6 +58,7 @@ type ConnProvider interface {
 	Closing() bool
 	Host() string
 	Logger() rabbitmq.Logger
+	LogType() rabbitmq.LogType
 	RegisterConsumer(name string, c *Consumer)
 	UnregisterConsumer(name string)
 }
@@ -95,17 +96,17 @@ func (d Delivery) GetRoutingKey() string {
 type Retry struct {
 	Enabled    bool
 	MaxAttempt int
-	// DelayFn computes the delay in milliseconds before the next retry.
-	DelayFn func(content Delivery, attempt int32, err error) int32
+	// RetryFunc computes the delay in milliseconds before the next retry.
+	RetryFunc func(content Delivery, attempt int32, err error) int32
 }
 
 // Deadletter configures the dead letter behaviour for a [Consumer].
 type Deadletter struct {
 	Enabled     bool
 	DLQueueName string
-	// CallbackFn is called before sending the message to the DLQ.
+	// DLQFunc is called before sending the message to the DLQ.
 	// Return true to send to DLQ (nack), false to acknowledge and drop.
-	CallbackFn func(Delivery) bool
+	DLQFunc func(Delivery) bool
 }
 
 // Options holds all configuration for a [Consumer].
@@ -127,13 +128,13 @@ var defaults = &Options{
 	RetryStrategy: &Retry{
 		Enabled:    true,
 		MaxAttempt: defaultMaxRetry,
-		DelayFn: func(d Delivery, attempt int32, err error) int32 {
+		RetryFunc: func(d Delivery, attempt int32, err error) int32 {
 			return attempt * retryMultiplier
 		},
 	},
 	DeadletterStrategy: &Deadletter{
-		Enabled:    true,
-		CallbackFn: nil,
+		Enabled: true,
+		DLQFunc: nil,
 	},
 }
 
@@ -186,13 +187,13 @@ func WithRetryMaxAttempt(max int) Option {
 
 // WithRetryFn provides a custom delay function for the retry strategy.
 func WithRetryFn(fn func(d Delivery, attempt int32, err error) int32) Option {
-	return func(c *Consumer) { c.params.RetryStrategy.DelayFn = fn }
+	return func(c *Consumer) { c.params.RetryStrategy.RetryFunc = fn }
 }
 
 // WithDLQFn provides a callback that is invoked before sending a
 // message to the dead letter queue.
 func WithDLQFn(fn func(Delivery) bool) Option {
-	return func(c *Consumer) { c.params.DeadletterStrategy.CallbackFn = fn }
+	return func(c *Consumer) { c.params.DeadletterStrategy.DLQFunc = fn }
 }
 
 // WithHeadersBinding sets custom header arguments used when binding the queue
@@ -340,22 +341,31 @@ func (c *Consumer) consume() {
 }
 
 func (c *Consumer) processDelivery(d Delivery) {
+	start := time.Now()
+	var handlerErr error
+	var retried bool
+
 	defer func() {
 		if r := recover(); r != nil {
 			c.conn.Logger().Error("recovered from panic in consumer: %v", r)
-			c.retry(d, fmt.Errorf("panic: %v", r))
+			handlerErr = fmt.Errorf("panic: %v", r)
+		}
+
+		if handlerErr != nil {
+			retried = c.retry(d, handlerErr)
+		} else {
+			if err := d.Ack(false); err != nil {
+				c.conn.Logger().Error("could not ack message: %v", err)
+			}
+		}
+
+		elapsed := time.Since(start)
+		if c.conn.LogType().Includes(rabbitmq.LogTypeConsumer) || handlerErr != nil {
+			c.inspect(d, elapsed, handlerErr, handlerErr != nil && !retried)
 		}
 	}()
 
-	if err := c.params.Callback(d, c.params.Queue); err != nil {
-		c.conn.Logger().Error("error processing message: %v", err)
-		c.retry(d, err)
-		return
-	}
-
-	if err := d.Ack(false); err != nil {
-		c.conn.Logger().Error("could not ack message: %v", err)
-	}
+	handlerErr = c.params.Callback(d, c.params.Queue)
 }
 
 // Disconnect stops delivering messages, waits for in-flight handlers,
@@ -378,7 +388,7 @@ func (c *Consumer) Disconnect() {
 
 // --- Retry and dead letter ---
 
-func (c *Consumer) retry(d Delivery, err error) {
+func (c *Consumer) retry(d Delivery, err error) bool {
 	retryCount, ok := d.Headers[amqpx.KeyRetriesCount].(int32)
 	if !ok {
 		retryCount = 1
@@ -386,14 +396,15 @@ func (c *Consumer) retry(d Delivery, err error) {
 
 	if !c.params.RetryStrategy.Enabled || retryCount >= int32(c.params.RetryStrategy.MaxAttempt) {
 		c.deadletter(d)
-		return
+		return false
 	}
 
 	c.publishRetry(d, retryCount, err)
+	return true
 }
 
 func (c *Consumer) publishRetry(d Delivery, retryCount int32, err error) {
-	delayAmount := c.params.RetryStrategy.DelayFn(d, retryCount, err)
+	delayAmount := c.params.RetryStrategy.RetryFunc(d, retryCount, err)
 	headers := amqpx.MergeTable(d.Headers, amqp.Table{
 		amqpx.KeyRetriesCount: retryCount + 1,
 	})
@@ -437,8 +448,8 @@ func (c *Consumer) sendToDeadletter(d Delivery) {
 		}
 	}()
 
-	sendToDLQ := c.params.DeadletterStrategy.CallbackFn == nil ||
-		c.params.DeadletterStrategy.CallbackFn(d)
+	sendToDLQ := c.params.DeadletterStrategy.DLQFunc == nil ||
+		c.params.DeadletterStrategy.DLQFunc(d)
 
 	if sendToDLQ {
 		if err := d.Nack(false, false); err != nil {
@@ -450,6 +461,23 @@ func (c *Consumer) sendToDeadletter(d Delivery) {
 	if err := d.Ack(false); err != nil {
 		c.conn.Logger().Error("failed to ack - deadletter: %v", err)
 	}
+}
+
+// --- Inspection logging ---
+
+func (c *Consumer) inspect(d Delivery, elapsed time.Duration, err error, isDead bool) {
+	title := fmt.Sprintf("[AMQP] [CONSUMER] [%s] [%s] [%s]",
+		c.params.ExchangeName, d.RoutingKey, c.params.Queue)
+
+	ms := elapsed.Milliseconds()
+
+	if err != nil {
+		c.conn.Logger().Error("%s | duration=%d isDead=%t error=%v",
+			title, ms, isDead, err)
+		return
+	}
+
+	c.conn.Logger().Info("%s | duration=%d", title, ms)
 }
 
 // --- Queue declarations ---

@@ -345,7 +345,7 @@ func TestDeadletter_CallbackReturnsFalse_AcksMessage(t *testing.T) {
 	ch := &mockAMQPChannel{}
 	conn := &mockConnProvider{}
 	c := newTestConsumer(ch, conn)
-	c.params.DeadletterStrategy.CallbackFn = func(body Delivery) bool {
+	c.params.DeadletterStrategy.DLQFunc = func(body Delivery) bool {
 		return false
 	}
 
@@ -368,7 +368,7 @@ func TestDeadletter_CallbackPanics_Nacks(t *testing.T) {
 	ch := &mockAMQPChannel{}
 	conn := &mockConnProvider{}
 	c := newTestConsumer(ch, conn)
-	c.params.DeadletterStrategy.CallbackFn = func(body Delivery) bool {
+	c.params.DeadletterStrategy.DLQFunc = func(body Delivery) bool {
 		panic("callback panic")
 	}
 
@@ -537,14 +537,14 @@ func TestFunctionalOptions(t *testing.T) {
 	// WithRetryFn
 	customFn := func(d Delivery, attempt int32, err error) int32 { return 999 }
 	WithRetryFn(customFn)(c)
-	if c.params.RetryStrategy.DelayFn(Delivery{}, 1, nil) != 999 {
+	if c.params.RetryStrategy.RetryFunc(Delivery{}, 1, nil) != 999 {
 		t.Fatal("expected custom delay fn to return 999")
 	}
 
 	// WithDLQFn
 	dlqCalled := false
 	WithDLQFn(func(Delivery) bool { dlqCalled = true; return true })(c)
-	c.params.DeadletterStrategy.CallbackFn(Delivery{})
+	c.params.DeadletterStrategy.DLQFunc(Delivery{})
 	if !dlqCalled {
 		t.Fatal("expected DLQ callback to be set and called")
 	}

@@ -8,6 +8,7 @@ package publisher
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -46,6 +47,7 @@ type ConnProvider interface {
 	Reconnecting() bool
 	Closing() bool
 	Logger() rabbitmq.Logger
+	LogType() rabbitmq.LogType
 	SetPublisher(p *Publisher)
 }
 
@@ -219,11 +221,21 @@ func (p *Publisher) Publish(msg Message) error {
 		return err
 	}
 
+	start := time.Now()
+	var publishErr error
+
 	if p.publishConfirms {
-		return p.publishWithConfirmation(msg)
+		publishErr = p.publishWithConfirmation(msg)
+	} else {
+		publishErr = p.publishWithoutConfirmation(msg)
 	}
 
-	return p.publishWithoutConfirmation(msg)
+	elapsed := time.Since(start)
+	if p.conn.LogType().Includes(rabbitmq.LogTypePublisher) || publishErr != nil {
+		p.inspect(msg, elapsed, publishErr)
+	}
+
+	return publishErr
 }
 
 func (p *Publisher) waitForConnection() error {
@@ -293,6 +305,22 @@ func (p *Publisher) publishWithoutConfirmation(msg Message) error {
 			amqpx.KeyPublishedAt:      time.Now().String(),
 		}, msg.Headers),
 	})
+}
+
+// --- Inspection logging ---
+
+func (p *Publisher) inspect(msg Message, elapsed time.Duration, err error) {
+	title := fmt.Sprintf("[AMQP] [PUBLISH] [%s] [%s]",
+		msg.Exchange, msg.RoutingKey)
+
+	ms := elapsed.Milliseconds()
+
+	if err != nil {
+		p.conn.Logger().Error("%s | duration=%d error=%v", title, ms, err)
+		return
+	}
+
+	p.conn.Logger().Info("%s | duration=%d", title, ms)
 }
 
 func (p *Publisher) monitorChannel() {
