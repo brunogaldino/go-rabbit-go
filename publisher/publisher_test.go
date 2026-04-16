@@ -3,14 +3,32 @@ package publisher
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
+	"unsafe"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 
 	rabbitmq "github.com/brunogaldino/go-rabbit-go"
 	"github.com/brunogaldino/go-rabbit-go/amqpx"
 )
+
+// newTestDeferredConfirmation creates a DeferredConfirmation that is already
+// resolved with the given ack value. Used in tests to avoid depending on
+// the internal confirms infrastructure.
+func newTestDeferredConfirmation(tag uint64, ack bool) *amqp.DeferredConfirmation {
+	dc := &amqp.DeferredConfirmation{DeliveryTag: tag}
+
+	v := reflect.ValueOf(dc).Elem()
+
+	done := make(chan struct{})
+	close(done)
+	*(*chan struct{})(unsafe.Pointer(v.FieldByName("done").UnsafeAddr())) = done
+	*(*bool)(unsafe.Pointer(v.FieldByName("ack").UnsafeAddr())) = ack
+
+	return dc
+}
 
 func TestConnect_Success(t *testing.T) {
 	ch := &mockAMQPChannel{}
@@ -182,12 +200,9 @@ func TestDeclareExchanges_DefaultOptions(t *testing.T) {
 }
 
 func TestPublish_WithConfirmation(t *testing.T) {
-	confirmCh := make(chan amqp.Confirmation, 1)
-	confirmCh <- amqp.Confirmation{Ack: true, DeliveryTag: 1}
-
 	ch := &mockAMQPChannel{
 		PublishWithDeferredConfirmFn: func(string, string, bool, bool, amqp.Publishing) (*amqp.DeferredConfirmation, error) {
-			return nil, nil
+			return newTestDeferredConfirmation(1, true), nil
 		},
 	}
 
@@ -195,7 +210,6 @@ func TestPublish_WithConfirmation(t *testing.T) {
 		conn:            &mockConnProvider{},
 		ch:              ch,
 		publishConfirms: true,
-		confirmCh:       confirmCh,
 		isConnected:     true,
 		wg:              &sync.WaitGroup{},
 	}
@@ -211,12 +225,9 @@ func TestPublish_WithConfirmation(t *testing.T) {
 }
 
 func TestPublish_Nack(t *testing.T) {
-	confirmCh := make(chan amqp.Confirmation, 1)
-	confirmCh <- amqp.Confirmation{Ack: false, DeliveryTag: 42}
-
 	ch := &mockAMQPChannel{
 		PublishWithDeferredConfirmFn: func(string, string, bool, bool, amqp.Publishing) (*amqp.DeferredConfirmation, error) {
-			return nil, nil
+			return newTestDeferredConfirmation(42, false), nil
 		},
 	}
 
@@ -224,7 +235,6 @@ func TestPublish_Nack(t *testing.T) {
 		conn:            &mockConnProvider{},
 		ch:              ch,
 		publishConfirms: true,
-		confirmCh:       confirmCh,
 		isConnected:     true,
 		wg:              &sync.WaitGroup{},
 	}
@@ -301,14 +311,11 @@ func TestWaitForConnection_NotBlocked(t *testing.T) {
 }
 
 func TestPublish_CustomContentType(t *testing.T) {
-	confirmCh := make(chan amqp.Confirmation, 1)
-	confirmCh <- amqp.Confirmation{Ack: true, DeliveryTag: 1}
-
 	var gotContentType string
 	ch := &mockAMQPChannel{
 		PublishWithDeferredConfirmFn: func(_, _ string, _, _ bool, msg amqp.Publishing) (*amqp.DeferredConfirmation, error) {
 			gotContentType = msg.ContentType
-			return nil, nil
+			return newTestDeferredConfirmation(1, true), nil
 		},
 	}
 
@@ -316,7 +323,6 @@ func TestPublish_CustomContentType(t *testing.T) {
 		conn:            &mockConnProvider{},
 		ch:              ch,
 		publishConfirms: true,
-		confirmCh:       confirmCh,
 		isConnected:     true,
 		wg:              &sync.WaitGroup{},
 	}

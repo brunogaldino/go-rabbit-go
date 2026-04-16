@@ -31,12 +31,11 @@ const DefaultContentType = "application/json"
 
 // Publisher timing and limit defaults.
 const (
-	publishTimeout    = 5 * time.Second
-	blockMaxRetries   = 5
-	blockDelay        = 5 * time.Second
-	maxReconnect      = 5
-	reconnectBase     = 1 * time.Second
-	confirmBufferSize = 100
+	publishTimeout  = 5 * time.Second
+	blockMaxRetries = 5
+	blockDelay      = 5 * time.Second
+	maxReconnect    = 5
+	reconnectBase   = 1 * time.Second
 )
 
 // ConnProvider defines what a [Publisher] needs from its connection
@@ -80,7 +79,6 @@ type Publisher struct {
 	conn             ConnProvider
 	ch               amqpx.AMQPChannel
 	wg               *sync.WaitGroup
-	confirmCh        chan amqp.Confirmation
 	publishConfirms  bool
 	notifyChanClose  chan *amqp.Error
 	config           []ExchangeOption
@@ -135,8 +133,6 @@ func (p *Publisher) Connect() error {
 	if err := ch.Confirm(false); err != nil {
 		return &rabbitmq.ChannelError{Operation: "confirm", Err: err}
 	}
-
-	p.confirmCh = ch.NotifyPublish(make(chan amqp.Confirmation, confirmBufferSize))
 
 	if err := p.declareExchanges(ch); err != nil {
 		return err
@@ -266,7 +262,7 @@ func (p *Publisher) publishWithConfirmation(msg Message) error {
 		msg.ContentType = DefaultContentType
 	}
 
-	_, err := p.ch.PublishWithDeferredConfirm(msg.Exchange,
+	confirmation, err := p.ch.PublishWithDeferredConfirm(msg.Exchange,
 		msg.RoutingKey,
 		false,
 		false,
@@ -283,12 +279,11 @@ func (p *Publisher) publishWithConfirmation(msg Message) error {
 		return err
 	}
 
-	confirm := <-p.confirmCh
-	if confirm.Ack {
+	if confirmation.Wait() {
 		return nil
 	}
 
-	return &PublishError{Tag: confirm.DeliveryTag, Reason: "nack"}
+	return &PublishError{Tag: confirmation.DeliveryTag, Reason: "nack"}
 }
 
 func (p *Publisher) publishWithoutConfirmation(msg Message) error {
