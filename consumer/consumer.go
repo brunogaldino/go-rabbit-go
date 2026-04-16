@@ -66,9 +66,22 @@ type ConnProvider interface {
 // Handler is the function signature for message processing callbacks.
 type Handler func(Delivery, string) error
 
-// Delivery wraps an [amqp.Delivery] with convenience methods.
+// Delivery wraps an [amqp.Delivery] exposing only safe, read-only fields.
+// Ack/Nack are handled automatically by the consumer — handlers should
+// return nil to acknowledge or an error to trigger the retry strategy.
 type Delivery struct {
-	amqp.Delivery
+	delivery      amqp.Delivery
+	Body          []byte
+	Headers       amqp.Table
+	RoutingKey    string
+	ContentType   string
+	CorrelationId string
+}
+
+// Raw returns the underlying [amqp.Delivery] for access to fields not
+// exposed directly (e.g. AppId, Timestamp, MessageId).
+func (d Delivery) Raw() amqp.Delivery {
+	return d.delivery
 }
 
 // GetHeader returns the value of a header by key, or nil if not present.
@@ -332,8 +345,15 @@ func (c *Consumer) consume() {
 		return
 	}
 
-	for d := range msgs {
-		d := Delivery{d}
+	for msg := range msgs {
+		d := Delivery{
+			delivery:      msg,
+			Body:          msg.Body,
+			Headers:       msg.Headers,
+			RoutingKey:    msg.RoutingKey,
+			ContentType:   msg.ContentType,
+			CorrelationId: msg.CorrelationId,
+		}
 		c.wg.Go(func() {
 			c.processDelivery(d)
 		})
@@ -354,7 +374,7 @@ func (c *Consumer) processDelivery(d Delivery) {
 		if handlerErr != nil {
 			retried = c.retry(d, handlerErr)
 		} else {
-			if err := d.Ack(false); err != nil {
+			if err := d.delivery.Ack(false); err != nil {
 				c.conn.Logger().Error("could not ack message: %v", err)
 			}
 		}
@@ -393,18 +413,18 @@ func (c *Consumer) retry(d Delivery, err error) bool {
 	if !ok {
 		retryCount = 1
 	}
+	delayAmount := c.params.RetryStrategy.RetryFunc(d, retryCount, err)
 
-	if !c.params.RetryStrategy.Enabled || retryCount >= int32(c.params.RetryStrategy.MaxAttempt) {
+	if !c.params.RetryStrategy.Enabled || retryCount >= int32(c.params.RetryStrategy.MaxAttempt) || delayAmount < 0 {
 		c.deadletter(d)
 		return false
 	}
 
-	c.publishRetry(d, retryCount, err)
+	c.publishRetry(d, retryCount, delayAmount, err)
 	return true
 }
 
-func (c *Consumer) publishRetry(d Delivery, retryCount int32, err error) {
-	delayAmount := c.params.RetryStrategy.RetryFunc(d, retryCount, err)
+func (c *Consumer) publishRetry(d Delivery, retryCount int32, delayAmount int32, err error) {
 	headers := amqpx.MergeTable(d.Headers, amqp.Table{
 		amqpx.KeyRetriesCount: retryCount + 1,
 	})
@@ -419,11 +439,11 @@ func (c *Consumer) publishRetry(d Delivery, retryCount int32, err error) {
 
 	if pubErr != nil {
 		c.conn.Logger().Error("failed to publish retry: %v", pubErr)
-		d.Nack(false, false)
+		d.delivery.Nack(false, false)
 		return
 	}
 
-	if ackErr := d.Ack(false); ackErr != nil {
+	if ackErr := d.delivery.Ack(false); ackErr != nil {
 		c.conn.Logger().Error("failed to ack original - retry: %v", ackErr)
 	}
 }
@@ -431,7 +451,7 @@ func (c *Consumer) publishRetry(d Delivery, retryCount int32, err error) {
 func (c *Consumer) deadletter(d Delivery) {
 	if !c.params.DeadletterStrategy.Enabled {
 		c.conn.Logger().Info("dlq strategy disabled, acking message")
-		if err := d.Ack(false); err != nil {
+		if err := d.delivery.Ack(false); err != nil {
 			c.conn.Logger().Error("failed to ack (dlq disabled): %v", err)
 		}
 		return
@@ -444,7 +464,7 @@ func (c *Consumer) sendToDeadletter(d Delivery) {
 	defer func() {
 		if r := recover(); r != nil {
 			c.conn.Logger().Error("panic in DLQ callback, forcing nack: %v", r)
-			d.Nack(false, false)
+			d.delivery.Nack(false, false)
 		}
 	}()
 
@@ -452,13 +472,13 @@ func (c *Consumer) sendToDeadletter(d Delivery) {
 		c.params.DeadletterStrategy.DLQFunc(d)
 
 	if sendToDLQ {
-		if err := d.Nack(false, false); err != nil {
+		if err := d.delivery.Nack(false, false); err != nil {
 			c.conn.Logger().Error("failed to nack - deadletter: %v", err)
 		}
 		return
 	}
 
-	if err := d.Ack(false); err != nil {
+	if err := d.delivery.Ack(false); err != nil {
 		c.conn.Logger().Error("failed to ack - deadletter: %v", err)
 	}
 }

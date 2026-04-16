@@ -35,6 +35,19 @@ func newTestConsumer(ch amqpx.AMQPChannel, conn ConnProvider) *Consumer {
 	return c
 }
 
+// testDelivery builds a Delivery from an amqp.Delivery, copying fields the
+// same way the production range loop does.
+func testDelivery(d amqp.Delivery) Delivery {
+	return Delivery{
+		delivery:      d,
+		Body:          d.Body,
+		Headers:       d.Headers,
+		RoutingKey:    d.RoutingKey,
+		ContentType:   d.ContentType,
+		CorrelationId: d.CorrelationId,
+	}
+}
+
 // --- New ---
 
 func TestNew_Success(t *testing.T) {
@@ -187,12 +200,12 @@ func TestProcessDelivery_Success(t *testing.T) {
 		return nil
 	}
 
-	d := Delivery{amqp.Delivery{
+	d := testDelivery(amqp.Delivery{
 		Acknowledger: &mockAcknowledger{
 			ackFn: func(_ uint64, _ bool) error { acked = true; return nil },
 		},
 		Body: []byte("hello"),
-	}}
+	})
 
 	c.processDelivery(d)
 
@@ -223,13 +236,13 @@ func TestProcessDelivery_Error_TriggersRetry(t *testing.T) {
 		return errors.New("processing error")
 	}
 
-	d := Delivery{amqp.Delivery{
+	d := testDelivery(amqp.Delivery{
 		Acknowledger: &mockAcknowledger{
 			ackFn: func(_ uint64, _ bool) error { acked = true; return nil },
 		},
 		Body:    []byte("hello"),
 		Headers: amqp.Table{},
-	}}
+	})
 
 	c.processDelivery(d)
 
@@ -256,11 +269,11 @@ func TestProcessDelivery_Panic_Recovers(t *testing.T) {
 		panic("kaboom")
 	}
 
-	d := Delivery{amqp.Delivery{
+	d := testDelivery(amqp.Delivery{
 		Acknowledger: &mockAcknowledger{},
 		Body:         []byte("data"),
 		Headers:      amqp.Table{},
-	}}
+	})
 
 	// Should not panic the test.
 	c.processDelivery(d)
@@ -278,7 +291,7 @@ func TestRetry_ExhaustedGoesToDeadletter(t *testing.T) {
 	conn := &mockConnProvider{}
 	c := newTestConsumer(ch, conn)
 
-	d := Delivery{amqp.Delivery{
+	d := testDelivery(amqp.Delivery{
 		Acknowledger: &mockAcknowledger{
 			nackFn: func(_ uint64, _ bool, _ bool) error { nacked = true; return nil },
 		},
@@ -286,7 +299,7 @@ func TestRetry_ExhaustedGoesToDeadletter(t *testing.T) {
 		Headers: amqp.Table{
 			amqpx.KeyRetriesCount: int32(defaults.RetryStrategy.MaxAttempt),
 		},
-	}}
+	})
 
 	c.retry(d, errors.New("some error"))
 
@@ -302,13 +315,13 @@ func TestRetry_DisabledGoesToDeadletter(t *testing.T) {
 	c := newTestConsumer(ch, conn)
 	c.params.RetryStrategy.Enabled = false
 
-	d := Delivery{amqp.Delivery{
+	d := testDelivery(amqp.Delivery{
 		Acknowledger: &mockAcknowledger{
 			nackFn: func(_ uint64, _ bool, _ bool) error { nacked = true; return nil },
 		},
 		Body:    []byte("no-retry"),
 		Headers: amqp.Table{},
-	}}
+	})
 
 	c.retry(d, errors.New("fail"))
 
@@ -326,12 +339,12 @@ func TestDeadletter_Disabled_AcksMessage(t *testing.T) {
 	c := newTestConsumer(ch, conn)
 	c.params.DeadletterStrategy.Enabled = false
 
-	d := Delivery{amqp.Delivery{
+	d := testDelivery(amqp.Delivery{
 		Acknowledger: &mockAcknowledger{
 			ackFn: func(_ uint64, _ bool) error { acked = true; return nil },
 		},
 		Body: []byte("drop"),
-	}}
+	})
 
 	c.deadletter(d)
 
@@ -349,12 +362,12 @@ func TestDeadletter_CallbackReturnsFalse_AcksMessage(t *testing.T) {
 		return false
 	}
 
-	d := Delivery{amqp.Delivery{
+	d := testDelivery(amqp.Delivery{
 		Acknowledger: &mockAcknowledger{
 			ackFn: func(_ uint64, _ bool) error { acked = true; return nil },
 		},
 		Body: []byte("skip-dlq"),
-	}}
+	})
 
 	c.deadletter(d)
 
@@ -372,12 +385,12 @@ func TestDeadletter_CallbackPanics_Nacks(t *testing.T) {
 		panic("callback panic")
 	}
 
-	d := Delivery{amqp.Delivery{
+	d := testDelivery(amqp.Delivery{
 		Acknowledger: &mockAcknowledger{
 			nackFn: func(_ uint64, _ bool, _ bool) error { nacked = true; return nil },
 		},
 		Body: []byte("panic-body"),
-	}}
+	})
 
 	// Should not panic the test.
 	c.sendToDeadletter(d)
@@ -462,9 +475,9 @@ func TestConsume_WithMessages(t *testing.T) {
 // --- Delivery helpers ---
 
 func TestDelivery_GetHeader(t *testing.T) {
-	d := Delivery{amqp.Delivery{
+	d := testDelivery(amqp.Delivery{
 		Headers: amqp.Table{"foo": "bar"},
-	}}
+	})
 
 	if got := d.GetHeader("foo"); got != "bar" {
 		t.Fatalf("expected 'bar', got %v", got)
@@ -475,7 +488,7 @@ func TestDelivery_GetHeader(t *testing.T) {
 	}
 
 	// nil headers
-	d2 := Delivery{amqp.Delivery{}}
+	d2 := testDelivery(amqp.Delivery{})
 	if got := d2.GetHeader("any"); got != nil {
 		t.Fatalf("expected nil for nil headers, got %v", got)
 	}
@@ -483,20 +496,20 @@ func TestDelivery_GetHeader(t *testing.T) {
 
 func TestDelivery_GetRoutingKey(t *testing.T) {
 	// With original routing key header.
-	d := Delivery{amqp.Delivery{
+	d := testDelivery(amqp.Delivery{
 		RoutingKey: "current-rk",
 		Headers:    amqp.Table{amqpx.KeyOriginalRouteKey: "original-rk"},
-	}}
+	})
 
 	if got := d.GetRoutingKey(); got != "original-rk" {
 		t.Fatalf("expected 'original-rk', got %q", got)
 	}
 
 	// Without header — falls back to RoutingKey.
-	d2 := Delivery{amqp.Delivery{
+	d2 := testDelivery(amqp.Delivery{
 		RoutingKey: "current-rk",
 		Headers:    amqp.Table{},
-	}}
+	})
 
 	if got := d2.GetRoutingKey(); got != "current-rk" {
 		t.Fatalf("expected 'current-rk', got %q", got)
@@ -670,15 +683,15 @@ func TestPublishRetry_PublishError_NacksMessage(t *testing.T) {
 	conn := &mockConnProvider{}
 	c := newTestConsumer(ch, conn)
 
-	d := Delivery{amqp.Delivery{
+	d := testDelivery(amqp.Delivery{
 		Acknowledger: &mockAcknowledger{
 			nackFn: func(_ uint64, _ bool, _ bool) error { nacked = true; return nil },
 		},
 		Body:    []byte("data"),
 		Headers: amqp.Table{},
-	}}
+	})
 
-	c.publishRetry(d, 1, errors.New("err"))
+	c.publishRetry(d, 1, 1, errors.New("err"))
 
 	if !nacked {
 		t.Fatal("expected nack when retry publish fails")

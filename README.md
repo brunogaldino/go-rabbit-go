@@ -405,6 +405,8 @@ consumer.WithRetryFn(func(d consumer.Delivery, attempt int32, err error) int32 {
 })
 ```
 
+Returning `< 0` will skip the retry entirely and send the message to the callback DLQ.
+
 ### Disabling retries
 
 ```go
