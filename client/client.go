@@ -1,7 +1,12 @@
 // Package client provides a dual-connection AMQP client with automatic
-// reconnection and lifecycle management. Each [Client] maintains two
+// reconnection and lifecycle management. Each [Client] manages up to two
 // independent connections (one for publishing, one for consuming) so
 // that broker flow-control only affects the publisher side.
+//
+// Connections are established lazily: each role's connection is dialed
+// only when the first channel for that role is requested — that is, when
+// a publisher or consumer is created. Applications that only publish (or
+// only consume) therefore open a single connection.
 //
 // A [Client] implements both [consumer.ConnProvider] and
 // [publisher.ConnProvider], allowing consumers and publishers from
@@ -47,9 +52,10 @@ type Config struct {
 	LogType rabbitmq.LogType
 }
 
-// Client manages two independent AMQP connections (one for publishing,
-// one for consuming) and coordinates their lifecycle, reconnection, and
-// graceful shutdown.
+// Client manages up to two independent AMQP connections (one for
+// publishing, one for consuming) and coordinates their lifecycle,
+// reconnection, and graceful shutdown. Each connection is dialed lazily
+// on the first channel request for its role.
 type Client struct {
 	conf    Config
 	ctx     context.Context
@@ -64,6 +70,16 @@ type Client struct {
 
 	isBlocked atomic.Bool
 	isClosing atomic.Bool
+
+	// Lazy dial state, one mutex per role. After the initial successful
+	// dial the role's monitor goroutine owns reconnection; the *MonitorStarted
+	// flags (guarded by their mutex) ensure each monitor starts once.
+	pubMu             sync.Mutex
+	conMu             sync.Mutex
+	pubMonitorStarted bool
+	conMonitorStarted bool
+	pubRequested      atomic.Bool
+	conRequested      atomic.Bool
 
 	mu          sync.Mutex
 	publisherCh *publisher.Publisher
@@ -118,7 +134,13 @@ func New(ctx context.Context, config Config) (*Client, *sync.WaitGroup) {
 
 // --- consumer.ConnProvider implementation ---
 
+// Channel lazily establishes the consumer connection on first use and
+// opens a new AMQP channel on it.
 func (c *Client) Channel() (amqpx.AMQPChannel, error) {
+	if err := c.ensureConsumerConn(); err != nil {
+		return nil, err
+	}
+
 	return c.con.Conn.Channel()
 }
 
@@ -146,6 +168,10 @@ func (c *Client) UnregisterConsumer(name string) {
 type publisherConn struct{ c *Client }
 
 func (a *publisherConn) Channel() (amqpx.AMQPChannel, error) {
+	if err := a.c.ensurePublisherConn(); err != nil {
+		return nil, err
+	}
+
 	return a.c.pub.Conn.Channel()
 }
 func (a *publisherConn) Blocked() bool             { return a.c.isBlocked.Load() }
@@ -213,19 +239,78 @@ func (c *Client) connectConsumer() error {
 	return nil
 }
 
-// Connect establishes both the publisher and consumer connections to the
-// broker and starts their monitor goroutines.
+// Connect validates the client configuration without dialing the broker.
+// Connections are established lazily: each role's connection (publisher
+// or consumer) is dialed on the first channel request for that role,
+// i.e. when a publisher or consumer is created.
+//
+// Calling Connect is optional. It is kept for early URI validation and
+// backwards compatibility with the previous eager-dial behaviour.
 func (c *Client) Connect() error {
+	if _, err := amqp.ParseURI(c.conf.URI); err != nil {
+		return fmt.Errorf("rabbitmq: invalid AMQP URI: %w", err)
+	}
+
+	return nil
+}
+
+// ensurePublisherConn dials the publisher connection on first use and
+// starts its monitor goroutine. After the initial successful dial, the
+// monitor owns reconnection and this becomes a no-op. A failed initial
+// dial is retried on the next call.
+func (c *Client) ensurePublisherConn() error {
+	c.pubMu.Lock()
+	defer c.pubMu.Unlock()
+
+	// Checked under the mutex so a dial can never start after
+	// Disconnect has begun closing connections or the context was
+	// cancelled.
+	if c.isClosing.Load() || c.ctx.Err() != nil {
+		return rabbitmq.ErrConnectionClosed
+	}
+
+	c.pubRequested.Store(true)
+
+	if c.pubMonitorStarted {
+		return nil
+	}
+
 	if err := c.connectPublisher(); err != nil {
 		return err
 	}
 
+	c.pubMonitorStarted = true
+	c.wg.Go(func() { c.monitorPublisherConn() })
+
+	return nil
+}
+
+// ensureConsumerConn dials the consumer connection on first use and
+// starts its monitor goroutine. After the initial successful dial, the
+// monitor owns reconnection and this becomes a no-op. A failed initial
+// dial is retried on the next call.
+func (c *Client) ensureConsumerConn() error {
+	c.conMu.Lock()
+	defer c.conMu.Unlock()
+
+	// Checked under the mutex so a dial can never start after
+	// Disconnect has begun closing connections or the context was
+	// cancelled.
+	if c.isClosing.Load() || c.ctx.Err() != nil {
+		return rabbitmq.ErrConnectionClosed
+	}
+
+	c.conRequested.Store(true)
+
+	if c.conMonitorStarted {
+		return nil
+	}
+
 	if err := c.connectConsumer(); err != nil {
-		c.pub.Close()
 		return err
 	}
 
-	c.wg.Go(func() { c.monitorPublisherConn() })
+	c.conMonitorStarted = true
 	c.wg.Go(func() { c.monitorConsumerConn() })
 
 	return nil
@@ -245,22 +330,46 @@ func (c *Client) reconnectPublisher() {
 	c.pub.ReconnectAttempt++
 	// TODO: exponential backoff with jitter
 	time.Sleep(reconnectDelay)
-	c.pub.Close()
 
-	if err := c.connectPublisher(); err != nil {
+	if !c.redialPublisher() {
 		return
 	}
-
-	c.pub.ReconnectAttempt = 0
-	c.logger.Info("successfully reconnected publisher connection")
 
 	if c.publisherCh == nil {
 		return
 	}
 
+	// Called without holding pubMu: Connect() requests a channel, which
+	// re-enters ensurePublisherConn.
 	if err := c.publisherCh.Connect(); err != nil {
 		c.logger.Error(fmt.Sprintf("failed to reconnect publisher channel: %v", err))
 	}
+}
+
+// redialPublisher closes the dropped publisher connection and dials a
+// new one, serialized with lazy dials and Disconnect. It reports
+// whether the connection was re-established.
+func (c *Client) redialPublisher() bool {
+	c.pubMu.Lock()
+	defer c.pubMu.Unlock()
+
+	// Re-checked under the mutex: Disconnect may have run during the
+	// backoff sleep, and redialing after it would leak a connection.
+	if c.isClosing.Load() {
+		c.pub.IsReconnecting.Store(false)
+		return false
+	}
+
+	c.pub.Close()
+
+	if err := c.connectPublisher(); err != nil {
+		return false
+	}
+
+	c.pub.ReconnectAttempt = 0
+	c.logger.Info("successfully reconnected publisher connection")
+
+	return true
 }
 
 func (c *Client) reconnectConsumer() {
@@ -278,6 +387,17 @@ func (c *Client) reconnectConsumer() {
 
 	// TODO: exponential backoff with jitter
 	time.Sleep(reconnectDelay)
+
+	c.conMu.Lock()
+	defer c.conMu.Unlock()
+
+	// Re-checked under the mutex: Disconnect may have run during the
+	// backoff sleep, and redialing after it would leak a connection.
+	if c.isClosing.Load() {
+		c.con.IsReconnecting.Store(false)
+		return
+	}
+
 	c.con.Close()
 
 	if err := c.connectConsumer(); err != nil {
@@ -340,18 +460,20 @@ func (c *Client) monitorConsumerConn() {
 			}
 
 		case <-c.ctx.Done():
+			c.logger.Info("gracefully shutting down connections via context")
+			c.Disconnect()
 			return
 		}
 	}
 }
 
 // Disconnect gracefully shuts down the publisher, all consumers, and
-// both AMQP connections. It is safe to call multiple times.
+// any established AMQP connections. It is safe to call multiple times
+// and from concurrent goroutines.
 func (c *Client) Disconnect() {
-	if c.isClosing.Load() {
+	if !c.isClosing.CompareAndSwap(false, true) {
 		return
 	}
-	c.isClosing.Store(true)
 
 	if c.publisherCh != nil {
 		c.publisherCh.Disconnect()
@@ -375,6 +497,14 @@ func (c *Client) Disconnect() {
 		wg.Wait()
 	}
 
+	// Serialize with in-flight lazy dials and monitor redials: once the
+	// role mutexes are held, no new connection can appear, so whatever
+	// exists now is everything there is to close.
+	c.pubMu.Lock()
+	c.conMu.Lock()
+	defer c.conMu.Unlock()
+	defer c.pubMu.Unlock()
+
 	c.pub.Close()
 	c.con.Close()
 	c.pub.MarkDisconnected()
@@ -382,12 +512,19 @@ func (c *Client) Disconnect() {
 }
 
 // CheckHealth returns a snapshot of the client's connection status.
+// Connected reflects only the roles that have been requested: a role
+// whose connection was never needed (no publisher or no consumer
+// created) does not degrade the overall status. A client that has been
+// disconnected always reports Connected as false.
 func (c *Client) CheckHealth() HealthStatus {
 	pubConn := c.pub.IsConnected.Load()
 	conConn := c.con.IsConnected.Load()
 
+	pubOK := !c.pubRequested.Load() || pubConn
+	conOK := !c.conRequested.Load() || conConn
+
 	return HealthStatus{
-		Connected:          pubConn && conConn,
+		Connected:          !c.isClosing.Load() && pubOK && conOK,
 		PublisherConnected: pubConn,
 		ConsumerConnected:  conConn,
 		Blocked:            c.isBlocked.Load(),

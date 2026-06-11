@@ -54,7 +54,9 @@ func New(ctx context.Context, configs []ConnectionConfig) *ConnectionManager {
 	return cm
 }
 
-// ConnectAll establishes both connections for every configured client.
+// ConnectAll validates the configuration of every managed client.
+// Connections are dialed lazily by each client when its first
+// publisher or consumer is created.
 func (cm *ConnectionManager) ConnectAll() error {
 	for name, c := range cm.clients {
 		if err := c.Connect(); err != nil {
