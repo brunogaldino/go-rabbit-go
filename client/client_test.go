@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 
@@ -478,5 +479,159 @@ func TestClient_RegisterUnregisterConsumer(t *testing.T) {
 	c.mu.Unlock()
 	if ok {
 		t.Fatal("expected consumer to be unregistered")
+	}
+}
+
+// dropConnectionsClient builds a client whose initial dials succeed and
+// whose redials always fail, capturing the NotifyError channels so the
+// test can simulate the broker dropping the connections (amqp091-go
+// sends the close error and then closes the registered channel).
+func dropConnectionsClient(t *testing.T, maxReconnect int) (*Client, *sync.WaitGroup, *atomic.Int32, []chan *amqp.Error) {
+	t.Helper()
+
+	var dials atomic.Int32
+	notify := make(chan chan *amqp.Error, 2)
+
+	c, wg := New(context.Background(), Config{
+		URI:                  "amqp://test:test@localhost/",
+		MaxReconnectAttempts: maxReconnect,
+		Logger:               &mockLogger{disabled: true},
+		Dialer: &mockDialer{dialFn: func(_ string, _ amqp.Config) (amqpx.AMQPConnection, error) {
+			if dials.Add(1) <= 2 {
+				return &mockAMQPConnection{
+					notifyCloseFn: func(ch chan *amqp.Error) chan *amqp.Error {
+						notify <- ch
+						return ch
+					},
+				}, nil
+			}
+			return nil, errors.New("broker still down")
+		}},
+	})
+
+	if err := c.Connect(); err != nil {
+		t.Fatalf("Connect() error: %v", err)
+	}
+
+	// With lazy dialing, Connect() no longer dials. Trigger both
+	// connections by requesting a channel for each role so the test
+	// can capture their NotifyError channels.
+	if _, err := c.PublisherConn().Channel(); err != nil {
+		t.Fatalf("publisher Channel() error: %v", err)
+	}
+
+	if _, err := c.Channel(); err != nil {
+		t.Fatalf("consumer Channel() error: %v", err)
+	}
+
+	// publisher dials first (PublisherConn.Channel above), then consumer.
+	pubNotify := <-notify
+	conNotify := <-notify
+
+	return c, wg, &dials, []chan *amqp.Error{pubNotify, conNotify}
+}
+
+func dropConn(ch chan *amqp.Error) {
+	ch <- &amqp.Error{Code: amqp.ConnectionForced, Reason: "test drop", Recover: true}
+	close(ch)
+}
+
+func waitOrFail(t *testing.T, wg *sync.WaitGroup, msg string) {
+	t.Helper()
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal(msg)
+	}
+}
+
+func TestMonitors_ExitAfterMaxReconnectAttempts(t *testing.T) {
+	oldDelay := reconnectDelay
+	reconnectDelay = 10 * time.Millisecond
+	defer func() { reconnectDelay = oldDelay }()
+
+	c, wg, dials, notify := dropConnectionsClient(t, 1)
+
+	dropConn(notify[0])
+	dropConn(notify[1])
+
+	// Before the fix the monitors spun forever on the closed NotifyError
+	// channels and wg.Wait() never returned.
+	waitOrFail(t, wg, "monitors did not exit after exhausting reconnect attempts (hot loop)")
+
+	// 2 initial dials + 1 failed redial per role.
+	if n := dials.Load(); n != 4 {
+		t.Fatalf("expected 4 dials (2 initial + 2 failed redials), got %d", n)
+	}
+
+	h := c.CheckHealth()
+	if h.PublisherConnected || h.ConsumerConnected {
+		t.Fatalf("expected both connections down, got %+v", h)
+	}
+
+	if h.Reconnecting {
+		t.Fatal("expected Reconnecting false after giving up")
+	}
+}
+
+func TestMonitors_ExitImmediately_WhenMaxReconnectAttemptsIsZero(t *testing.T) {
+	oldDelay := reconnectDelay
+	reconnectDelay = 10 * time.Millisecond
+	defer func() { reconnectDelay = oldDelay }()
+
+	c, wg, dials, notify := dropConnectionsClient(t, 0)
+
+	dropConn(notify[0])
+	dropConn(notify[1])
+
+	waitOrFail(t, wg, "monitors did not exit with MaxReconnectAttempts=0 (hot loop)")
+
+	// No redial may happen: only the 2 initial dials.
+	if n := dials.Load(); n != 2 {
+		t.Fatalf("expected 2 dials (no redials), got %d", n)
+	}
+
+	if h := c.CheckHealth(); h.Reconnecting {
+		t.Fatal("expected Reconnecting false after giving up")
+	}
+}
+
+func TestMonitors_ExhaustsAllAttempts_BothRoles(t *testing.T) {
+	// Validates that BOTH roles exhaust their full MaxReconnectAttempts
+	// before giving up — not just the first failed attempt.
+	oldDelay := reconnectDelay
+	reconnectDelay = 5 * time.Millisecond
+	defer func() { reconnectDelay = oldDelay }()
+
+	const maxAttempts = 3
+
+	c, wg, dials, notify := dropConnectionsClient(t, maxAttempts)
+
+	dropConn(notify[0])
+	dropConn(notify[1])
+
+	waitOrFail(t, wg, "monitors did not exit after exhausting all reconnect attempts")
+
+	// 2 initial + maxAttempts redials per role = 2 + 2*maxAttempts
+	want := int32(2 + 2*maxAttempts)
+	if n := dials.Load(); n != want {
+		t.Fatalf("expected %d total dials (2 initial + %d redials each role), got %d",
+			want, maxAttempts, n)
+	}
+
+	h := c.CheckHealth()
+	if h.PublisherConnected || h.ConsumerConnected {
+		t.Fatalf("expected both connections down after give-up, got %+v", h)
+	}
+
+	if h.Reconnecting {
+		t.Fatal("expected Reconnecting false after giving up")
 	}
 }
