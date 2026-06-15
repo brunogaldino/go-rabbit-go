@@ -271,6 +271,7 @@ func (p *Publisher) publishWithConfirmation(msg Message) error {
 			ContentType:   msg.ContentType,
 			CorrelationId: msg.CorrelationId,
 			Body:          msg.Message,
+			DeliveryMode:  amqp.Persistent,
 			Headers: amqpx.MergeTable(amqp.Table{
 				amqpx.KeyOriginalExchange: msg.Exchange,
 				amqpx.KeyOriginalRouteKey: msg.RoutingKey,

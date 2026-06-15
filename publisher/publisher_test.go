@@ -224,6 +224,36 @@ func TestPublish_WithConfirmation(t *testing.T) {
 	}
 }
 
+func TestPublish_WithConfirmation_IsPersistent(t *testing.T) {
+	var got amqp.Publishing
+	ch := &mockAMQPChannel{
+		PublishWithDeferredConfirmFn: func(_, _ string, _, _ bool, msg amqp.Publishing) (*amqp.DeferredConfirmation, error) {
+			got = msg
+			return newTestDeferredConfirmation(1, true), nil
+		},
+	}
+
+	p := &Publisher{
+		conn:            &mockConnProvider{},
+		ch:              ch,
+		publishConfirms: true,
+		isConnected:     true,
+		wg:              &sync.WaitGroup{},
+	}
+
+	if err := p.Publish(Message{
+		Exchange:   "events",
+		RoutingKey: "order.created",
+		Message:    []byte(`{"id":1}`),
+	}); err != nil {
+		t.Fatalf("Publish() error = %v, want nil", err)
+	}
+
+	if got.DeliveryMode != amqp.Persistent {
+		t.Fatalf("expected DeliveryMode %d (persistent), got %d", amqp.Persistent, got.DeliveryMode)
+	}
+}
+
 func TestPublish_Nack(t *testing.T) {
 	ch := &mockAMQPChannel{
 		PublishWithDeferredConfirmFn: func(string, string, bool, bool, amqp.Publishing) (*amqp.DeferredConfirmation, error) {

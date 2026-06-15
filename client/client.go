@@ -30,7 +30,8 @@ import (
 	"github.com/brunogaldino/go-rabbit-go/publisher"
 )
 
-const reconnectDelay = 5 * time.Second
+// reconnectDelay is a variable so tests can shorten the backoff.
+var reconnectDelay = 5 * time.Second
 
 // Config holds the connection parameters for a [Client].
 type Config struct {
@@ -316,14 +317,20 @@ func (c *Client) ensureConsumerConn() error {
 	return nil
 }
 
-func (c *Client) reconnectPublisher() {
+// reconnectPublisher attempts one reconnection cycle for the publisher
+// connection. It reports whether the monitor should keep watching:
+// false means the client is closing or all reconnection attempts have
+// been exhausted, and the monitor must exit.
+func (c *Client) reconnectPublisher() bool {
 	if c.isClosing.Load() {
-		return
+		c.pub.IsReconnecting.Store(false)
+		return false
 	}
 
 	if c.pub.ReconnectAttempt >= c.conf.MaxReconnectAttempts {
-		c.logger.Error("maximum publisher reconnection attempts reached")
-		return
+		c.pub.IsReconnecting.Store(false)
+		c.logger.Error(fmt.Sprintf("giving up on publisher connection: %v", rabbitmq.ErrMaxReconnectAttempts))
+		return false
 	}
 
 	c.pub.IsReconnecting.Store(true)
@@ -332,11 +339,21 @@ func (c *Client) reconnectPublisher() {
 	time.Sleep(reconnectDelay)
 
 	if !c.redialPublisher() {
-		return
+		if c.isClosing.Load() {
+			// Already cleared inside redialPublisher.
+			c.pub.IsReconnecting.Store(false)
+			return false
+		}
+		// Dial failed; return true so the monitor re-enters the select.
+		// The closed NotifyError channel delivers nil immediately,
+		// triggering the next attempt (max-attempts check at the top
+		// of this function will fire once attempts are exhausted —
+		// consistent with reconnectConsumer behavior).
+		return true
 	}
 
 	if c.publisherCh == nil {
-		return
+		return true
 	}
 
 	// Called without holding pubMu: Connect() requests a channel, which
@@ -344,6 +361,8 @@ func (c *Client) reconnectPublisher() {
 	if err := c.publisherCh.Connect(); err != nil {
 		c.logger.Error(fmt.Sprintf("failed to reconnect publisher channel: %v", err))
 	}
+
+	return true
 }
 
 // redialPublisher closes the dropped publisher connection and dials a
@@ -372,14 +391,20 @@ func (c *Client) redialPublisher() bool {
 	return true
 }
 
-func (c *Client) reconnectConsumer() {
+// reconnectConsumer attempts one reconnection cycle for the consumer
+// connection. It reports whether the monitor should keep watching:
+// false means the client is closing or all reconnection attempts have
+// been exhausted, and the monitor must exit.
+func (c *Client) reconnectConsumer() bool {
 	if c.isClosing.Load() {
-		return
+		c.con.IsReconnecting.Store(false)
+		return false
 	}
 
 	if c.con.ReconnectAttempt >= c.conf.MaxReconnectAttempts {
-		c.logger.Error("maximum consumer reconnection attempts reached")
-		return
+		c.con.IsReconnecting.Store(false)
+		c.logger.Error(fmt.Sprintf("giving up on consumer connection: %v", rabbitmq.ErrMaxReconnectAttempts))
+		return false
 	}
 
 	c.con.IsReconnecting.Store(true)
@@ -395,18 +420,19 @@ func (c *Client) reconnectConsumer() {
 	// backoff sleep, and redialing after it would leak a connection.
 	if c.isClosing.Load() {
 		c.con.IsReconnecting.Store(false)
-		return
+		return false
 	}
 
 	c.con.Close()
 
 	if err := c.connectConsumer(); err != nil {
-		return
+		return true
 	}
 
 	c.con.ReconnectAttempt = 0
 	c.logger.Info("successfully reconnected consumer connection")
 	// Consumer Begin() loops detect Connected() and re-setup automatically
+	return true
 }
 
 func (c *Client) monitorPublisherConn() {
@@ -429,8 +455,10 @@ func (c *Client) monitorPublisherConn() {
 
 			c.logger.Info("attempting to reconnect publisher connection")
 			c.pub.MarkDisconnected()
-			c.reconnectPublisher()
-			if c.isClosing.Load() {
+			// Exit when reconnection gives up: the dropped connection's
+			// NotifyError channel is closed and would otherwise yield
+			// nil in a tight loop forever.
+			if !c.reconnectPublisher() {
 				return
 			}
 
@@ -454,8 +482,10 @@ func (c *Client) monitorConsumerConn() {
 
 			c.logger.Info("attempting to reconnect consumer connection")
 			c.con.MarkDisconnected()
-			c.reconnectConsumer()
-			if c.isClosing.Load() {
+			// Exit when reconnection gives up: the dropped connection's
+			// NotifyError channel is closed and would otherwise yield
+			// nil in a tight loop forever.
+			if !c.reconnectConsumer() {
 				return
 			}
 
