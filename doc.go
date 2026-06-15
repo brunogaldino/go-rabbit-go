@@ -3,7 +3,7 @@
 // The library is organized into focused sub-packages:
 //
 //   - [github.com/brunogaldino/go-rabbit-go/client] — AMQP client with dual
-//     connections, reconnection, and lifecycle management.
+//     lazily-dialed connections, reconnection, and lifecycle management.
 //   - [github.com/brunogaldino/go-rabbit-go/consumer] — Message consumer with
 //     retry queues and dead letter support.
 //   - [github.com/brunogaldino/go-rabbit-go/publisher] — Message publisher with

@@ -55,19 +55,45 @@ func TestConnectAll_Success(t *testing.T) {
 		t.Fatal("expected health entry for 'primary'")
 	}
 
+	// No roles requested yet: nothing can be down, so the client is healthy.
 	if !h.Connected {
 		t.Fatal("expected 'primary' to be connected")
 	}
 }
 
-func TestConnectAll_Failure(t *testing.T) {
-	dialErr := errors.New("broker down")
+func TestConnectAll_LazyDial(t *testing.T) {
+	dialCount := 0
 	cm := New(context.Background(), newConfigs(
 		func(_ string, _ amqp.Config) (amqpx.AMQPConnection, error) {
-			return nil, dialErr
+			dialCount++
+			return &mockAMQPConnection{}, nil
 		},
-		"fail-conn",
+		"primary",
 	))
+
+	if err := cm.ConnectAll(); err != nil {
+		t.Fatalf("ConnectAll() error: %v", err)
+	}
+	defer cm.Disconnect()
+
+	if dialCount != 0 {
+		t.Fatalf("expected ConnectAll not to dial, got %d dials", dialCount)
+	}
+
+	// First channel request for the consumer role triggers a single dial.
+	if _, err := cm.Client("primary").Channel(); err != nil {
+		t.Fatalf("Channel() error: %v", err)
+	}
+
+	if dialCount != 1 {
+		t.Fatalf("expected 1 dial after first channel request, got %d", dialCount)
+	}
+}
+
+func TestConnectAll_Failure(t *testing.T) {
+	configs := newConfigs(successDialFn(), "fail-conn")
+	configs[0].Config.URI = "not-a-valid-uri"
+	cm := New(context.Background(), configs)
 
 	err := cm.ConnectAll()
 	if err == nil {

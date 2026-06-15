@@ -14,7 +14,7 @@ queues, dead letter handling, and publisher confirms out of the box.
   - [Single connection](#single-connection)
   - [Multi-vhost connections](#multi-vhost-connections)
 - [Architecture](#architecture)
-  - [Dual connections](#dual-connections)
+  - [Dual connections, dialed lazily](#dual-connections-dialed-lazily)
   - [Consumer auto-recovery](#consumer-auto-recovery)
   - [Project layout](#project-layout)
 - [Consumers](#consumers)
@@ -97,6 +97,8 @@ func main() {
         MaxReconnectAttempts: 10,
     })
 
+    // Optional: validates the URI. Connections are dialed lazily when the
+    // first publisher/consumer is created.
     if err := c.Connect(); err != nil {
         panic(err)
     }
@@ -193,20 +195,28 @@ The single-connection API (`client.New()` + `Connect()`) remains fully available
 
 ## Architecture
 
-### Dual connections
+### Dual connections, dialed lazily
 
-Each `Client` opens **two independent AMQP connections** to the broker:
+Each `Client` manages **up to two independent AMQP connections** to the broker.
+A connection is only dialed when the first channel for its role is requested —
+that is, when the first publisher or consumer is created on the client. An
+application that only publishes (or only consumes) opens a single connection,
+and no empty connections are left idling on the broker.
 
-| Connection | Purpose | Identified as |
-|-----------|---------|---------------|
-| Publisher | All publish operations | `{hostname}-publisher` |
-| Consumer | All consumer channels | `{hostname}-consumer` |
+| Connection | Purpose | Identified as | Dialed when |
+|-----------|---------|---------------|-------------|
+| Publisher | All publish operations | `{hostname}-publisher` | First `publisher.New()` |
+| Consumer | All consumer channels | `{hostname}-consumer` | First `consumer.New()` |
 
 This isolation means:
 
 - **Flow control** (broker blocking) only affects the publisher — consumers keep processing.
 - **Reconnection** of one side doesn't tear down the other.
-- Each connection has its own monitor goroutine and reconnection loop.
+- Each established connection has its own monitor goroutine and reconnection loop.
+
+`Connect()` (and `manager.ConnectAll()`) no longer dial the broker: they only
+validate the configured URI and are optional. Broker-unreachable errors
+surface at `publisher.New()` / `consumer.New()`, which already return errors.
 
 ### Consumer auto-recovery
 
@@ -492,12 +502,17 @@ Check the connection status of a client:
 ```go
 status := c.CheckHealth()
 
-fmt.Println(status.Connected)          // true when both connections are up
+fmt.Println(status.Connected)          // true when every *requested* connection is up
 fmt.Println(status.PublisherConnected)  // publisher connection status
 fmt.Println(status.ConsumerConnected)   // consumer connection status
 fmt.Println(status.Blocked)            // true if the publisher is blocked by the broker
 fmt.Println(status.Reconnecting)       // true if any reconnection is in progress
 ```
+
+Connections are dialed lazily, so `Connected` only accounts for the roles the
+application actually uses: a publisher-only app reports `Connected: true` with
+`ConsumerConnected: false`, since the consumer connection was never requested.
+After `Disconnect()`, `Connected` is always `false`.
 
 With `manager`, get per-connection health:
 
@@ -516,7 +531,7 @@ the context is cancelled, the client:
 2. Waits for in-flight message handlers to complete
 3. Closes all consumer channels
 4. Closes the publisher channel
-5. Closes both connections (publisher and consumer)
+5. Closes any established connections (publisher and/or consumer)
 
 ```go
 ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
