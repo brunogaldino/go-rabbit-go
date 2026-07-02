@@ -1,6 +1,10 @@
 // Package publisher provides a message publisher for AMQP with
-// publisher confirms, exchange declaration, and automatic channel
-// reconnection.
+// publisher confirms, exchange declaration, and lazy channel re-open.
+//
+// A [Publisher] owns a single AMQP channel. Channel-only failures are
+// recovered lazily on the next publish; connection-level drops are
+// recovered by the client's connection monitor, which re-dials and calls
+// [Publisher.Connect].
 //
 // A [Publisher] is created via [New] with a [ConnProvider] (typically a
 // [github.com/brunogaldino/go-rabbit-go/client.Client]).
@@ -10,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -34,8 +39,6 @@ const (
 	publishTimeout  = 5 * time.Second
 	blockMaxRetries = 5
 	blockDelay      = 5 * time.Second
-	maxReconnect    = 5
-	reconnectBase   = 1 * time.Second
 )
 
 // ConnProvider defines what a [Publisher] needs from its connection
@@ -74,21 +77,23 @@ type Message struct {
 }
 
 // Publisher publishes messages to the broker through a single AMQP
-// channel. It supports publisher confirms and automatic channel
-// reconnection.
+// channel. It supports publisher confirms and lazily re-opens its
+// channel when it has been closed. Connection-level recovery is owned by
+// the client's connection monitor, which calls [Publisher.Connect] after
+// re-dialing.
 type Publisher struct {
-	conn             ConnProvider
-	ch               amqpx.AMQPChannel
-	wg               *sync.WaitGroup
-	publishConfirms  bool
-	notifyChanClose  chan *amqp.Error
-	config           []ExchangeOption
-	reconnectAttempt int
+	conn            ConnProvider
+	ch              amqpx.AMQPChannel
+	publishConfirms bool
+	config          []ExchangeOption
+	disconnectOnce  sync.Once
+	closing         atomic.Bool
 
-	// isConnected/isReconnecting are lifecycle flags managed via manual
-	// Add/Done because Connect() and Disconnect() are separate call sites.
-	isConnected    bool
-	isReconnecting bool
+	// mu guards ch and isConnected, which are mutated by Connect (called
+	// from New, the client's reconnection, and lazy re-open) and read by
+	// the publish path concurrently.
+	mu          sync.Mutex
+	isConnected bool
 }
 
 // New creates a [Publisher] that declares the given exchanges. It
@@ -98,7 +103,6 @@ func New(conn ConnProvider, config []ExchangeOption) (*Publisher, error) {
 		config:          config,
 		conn:            conn,
 		publishConfirms: true,
-		wg:              &sync.WaitGroup{},
 	}
 
 	if err := pub.Connect(); err != nil {
@@ -110,41 +114,63 @@ func New(conn ConnProvider, config []ExchangeOption) (*Publisher, error) {
 	return pub, nil
 }
 
-// Connect opens a new AMQP channel, enables publisher confirms, and
-// declares all configured exchanges. It is called internally by [New]
-// and by the client after a connection-level reconnection.
+// Connect opens a new AMQP channel, enables publisher confirms (when
+// configured), and declares all configured exchanges. It is called by
+// [New], by the client after a connection-level reconnection, and
+// lazily before publishing when the channel has been closed. It is safe
+// to call repeatedly and concurrently.
 func (p *Publisher) Connect() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.openLocked()
+}
+
+// openLocked opens the channel and prepares it. Callers must hold p.mu.
+func (p *Publisher) openLocked() error {
 	ch, err := p.conn.Channel()
 	if err != nil {
 		return &rabbitmq.ChannelError{Operation: "open", Err: err}
 	}
 
-	p.notifyChanClose = make(chan *amqp.Error)
-	ch.NotifyClose(p.notifyChanClose)
-	go p.monitorChannel()
+	if p.publishConfirms {
+		if err := ch.Confirm(false); err != nil {
+			return &rabbitmq.ChannelError{Operation: "confirm", Err: err}
+		}
 
-	if !p.publishConfirms {
-		p.ch = ch
-		p.isConnected = true
-		// Lifecycle tracking: Add here, Done in Disconnect.
-		p.wg.Add(1)
-		return nil
+		if err := p.declareExchanges(ch); err != nil {
+			return err
+		}
 	}
 
-	if err := ch.Confirm(false); err != nil {
-		return &rabbitmq.ChannelError{Operation: "confirm", Err: err}
-	}
-
-	if err := p.declareExchanges(ch); err != nil {
-		return err
-	}
-
-	// Lifecycle tracking: Add here, Done in Disconnect.
-	p.wg.Add(1)
 	p.ch = ch
 	p.isConnected = true
 
 	return nil
+}
+
+// channel returns the current channel under lock.
+func (p *Publisher) channel() amqpx.AMQPChannel {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.ch
+}
+
+// ensureChannel re-opens the publisher channel if it has been closed
+// (for example after a channel-only failure). Connection-level drops are
+// recovered by the client's connection monitor, which calls Connect.
+func (p *Publisher) ensureChannel() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.ch != nil && !p.ch.IsClosed() {
+		return nil
+	}
+
+	if p.closing.Load() || p.conn.Closing() {
+		return rabbitmq.ErrConnectionClosed
+	}
+
+	return p.openLocked()
 }
 
 func (p *Publisher) declareExchanges(ch amqpx.AMQPChannel) error {
@@ -166,47 +192,28 @@ func (p *Publisher) declareExchanges(ch amqpx.AMQPChannel) error {
 	return nil
 }
 
-// Disconnect closes the publisher channel. It is safe to call even if
-// the channel is already closed.
+// Disconnect closes the publisher channel. It is idempotent and safe to
+// call multiple times and from concurrent goroutines: the teardown runs
+// exactly once.
 func (p *Publisher) Disconnect() error {
-	if p.ch.IsClosed() {
-		p.wg.Done()
-		return nil
-	}
+	var err error
+	p.disconnectOnce.Do(func() {
+		p.closing.Store(true)
 
-	p.conn.Logger().Info("closing publisher channel")
-	// TODO: Verificar se tem alguma mensagem presa em buffer antes de fechar
-	if err := p.ch.Close(); err != nil {
-		return &rabbitmq.ChannelError{Operation: "close", Err: err}
-	}
+		p.mu.Lock()
+		defer p.mu.Unlock()
 
-	p.wg.Done()
-
-	return nil
-}
-
-func (p *Publisher) reconnect() {
-	if p.reconnectAttempt >= maxReconnect {
-		p.conn.Logger().Error("maximum publisher channel reconnection attempts reached")
-		p.isConnected = false
-		p.isReconnecting = false
-		return
-	}
-
-	p.isReconnecting = true
-	p.reconnectAttempt++
-	reconnSleep := reconnectBase * time.Duration(p.reconnectAttempt)
-	p.conn.Logger().Info(fmt.Sprintf("reconnecting publisher channel in %.0fs: %d of %d attempts",
-		reconnSleep.Seconds(), p.reconnectAttempt, maxReconnect))
-	time.Sleep(reconnSleep)
-
-	if p.ch != nil {
-		if err := p.ch.Close(); err != nil {
-			p.conn.Logger().Error(fmt.Sprintf("close old publisher channel: %v", err))
+		if p.ch == nil || p.ch.IsClosed() {
+			return
 		}
-	}
 
-	p.Connect()
+		p.conn.Logger().Info("closing publisher channel")
+		if closeErr := p.ch.Close(); closeErr != nil {
+			err = &rabbitmq.ChannelError{Operation: "close", Err: closeErr}
+		}
+	})
+
+	return err
 }
 
 // Publish sends a message to the broker. If the connection is blocked or
@@ -215,6 +222,10 @@ func (p *Publisher) reconnect() {
 // the broker acknowledges the message.
 func (p *Publisher) Publish(msg Message) error {
 	if err := p.waitForConnection(); err != nil {
+		return err
+	}
+
+	if err := p.ensureChannel(); err != nil {
 		return err
 	}
 
@@ -263,7 +274,7 @@ func (p *Publisher) publishWithConfirmation(msg Message) error {
 		msg.ContentType = DefaultContentType
 	}
 
-	confirmation, err := p.ch.PublishWithDeferredConfirm(msg.Exchange,
+	confirmation, err := p.channel().PublishWithDeferredConfirm(msg.Exchange,
 		msg.RoutingKey,
 		false,
 		false,
@@ -293,7 +304,7 @@ func (p *Publisher) publishWithoutConfirmation(msg Message) error {
 	ctx, cancel := context.WithTimeout(context.Background(), publishTimeout)
 	defer cancel()
 
-	return p.ch.PublishWithContext(ctx, msg.Exchange, msg.RoutingKey, false, false, amqp.Publishing{
+	return p.channel().PublishWithContext(ctx, msg.Exchange, msg.RoutingKey, false, false, amqp.Publishing{
 		ContentType:   DefaultContentType,
 		CorrelationId: msg.CorrelationId,
 		Body:          msg.Message,
@@ -333,19 +344,4 @@ func (p *Publisher) inspect(msg Message, elapsed time.Duration, err error) {
 	}
 
 	p.conn.Logger().Info(title, data)
-}
-
-func (p *Publisher) monitorChannel() {
-	for err := range p.notifyChanClose {
-		if err != nil && !err.Recover {
-			p.conn.Logger().Error(fmt.Sprintf("shutting down publisher channel permanently: %s", err.Reason))
-			p.isConnected = false
-			return
-		}
-
-		if err != nil {
-			p.conn.Logger().Error(fmt.Sprintf("publisher channel closed: %s (recoverable: %t)", err.Reason, err.Recover))
-		}
-		p.reconnect()
-	}
 }

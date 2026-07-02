@@ -95,6 +95,7 @@ func main() {
         URI:                  "amqp://guest:guest@localhost:5672/",
         Heartbeat:            10 * time.Second,
         MaxReconnectAttempts: 10,
+        FatalOnDisconnnect:   false,
     })
 
     // Optional: validates the URI. Connections are dialed lazily when the

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"unsafe"
 
@@ -39,13 +40,11 @@ func TestConnect_Success(t *testing.T) {
 	p := &Publisher{
 		conn:            conn,
 		publishConfirms: true,
-		wg:              &sync.WaitGroup{},
 	}
 
 	if err := p.Connect(); err != nil {
 		t.Fatalf("Connect() error = %v, want nil", err)
 	}
-	defer close(p.notifyChanClose)
 
 	if !p.isConnected {
 		t.Fatal("expected isConnected to be true")
@@ -66,7 +65,6 @@ func TestConnect_ChannelError(t *testing.T) {
 	p := &Publisher{
 		conn:            conn,
 		publishConfirms: true,
-		wg:              &sync.WaitGroup{},
 	}
 
 	err := p.Connect()
@@ -96,11 +94,9 @@ func TestConnect_ConfirmError(t *testing.T) {
 	p := &Publisher{
 		conn:            conn,
 		publishConfirms: true,
-		wg:              &sync.WaitGroup{},
 	}
 
 	err := p.Connect()
-	close(p.notifyChanClose) // clean up monitorChannel goroutine
 
 	if err == nil {
 		t.Fatal("expected error, got nil")
@@ -211,7 +207,6 @@ func TestPublish_WithConfirmation(t *testing.T) {
 		ch:              ch,
 		publishConfirms: true,
 		isConnected:     true,
-		wg:              &sync.WaitGroup{},
 	}
 
 	err := p.Publish(Message{
@@ -238,7 +233,6 @@ func TestPublish_WithConfirmation_IsPersistent(t *testing.T) {
 		ch:              ch,
 		publishConfirms: true,
 		isConnected:     true,
-		wg:              &sync.WaitGroup{},
 	}
 
 	if err := p.Publish(Message{
@@ -266,7 +260,6 @@ func TestPublish_Nack(t *testing.T) {
 		ch:              ch,
 		publishConfirms: true,
 		isConnected:     true,
-		wg:              &sync.WaitGroup{},
 	}
 
 	err := p.Publish(Message{
@@ -302,7 +295,6 @@ func TestPublish_WithoutConfirmation(t *testing.T) {
 		ch:              ch,
 		publishConfirms: false,
 		isConnected:     true,
-		wg:              &sync.WaitGroup{},
 	}
 
 	err := p.Publish(Message{
@@ -354,7 +346,6 @@ func TestPublish_CustomContentType(t *testing.T) {
 		ch:              ch,
 		publishConfirms: true,
 		isConnected:     true,
-		wg:              &sync.WaitGroup{},
 	}
 
 	err := p.Publish(Message{
@@ -369,5 +360,90 @@ func TestPublish_CustomContentType(t *testing.T) {
 
 	if gotContentType != "application/xml" {
 		t.Fatalf("expected content type %q, got %q", "application/xml", gotContentType)
+	}
+}
+
+func TestDisconnect_Idempotent_Concurrent(t *testing.T) {
+	var closeCalls atomic.Int32
+	var closedFlag atomic.Bool
+
+	ch := &mockAMQPChannel{
+		CloseFn:    func() error { closeCalls.Add(1); closedFlag.Store(true); return nil },
+		IsClosedFn: func() bool { return closedFlag.Load() },
+	}
+	p := &Publisher{conn: &mockConnProvider{}, ch: ch}
+
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Go(func() {
+			if err := p.Disconnect(); err != nil {
+				t.Errorf("Disconnect() error = %v", err)
+			}
+		})
+	}
+	wg.Wait()
+
+	if n := closeCalls.Load(); n != 1 {
+		t.Fatalf("expected channel Close called once, got %d", n)
+	}
+}
+
+func TestPublish_ReopensClosedChannel(t *testing.T) {
+	var opens atomic.Int32
+
+	closedCh := &mockAMQPChannel{
+		IsClosedFn: func() bool { return true },
+	}
+	freshCh := &mockAMQPChannel{
+		ConfirmFn: func(bool) error { return nil },
+		PublishWithDeferredConfirmFn: func(string, string, bool, bool, amqp.Publishing) (*amqp.DeferredConfirmation, error) {
+			return newTestDeferredConfirmation(1, true), nil
+		},
+	}
+
+	conn := &mockConnProvider{
+		ChannelFn: func() (amqpx.AMQPChannel, error) {
+			opens.Add(1)
+			return freshCh, nil
+		},
+	}
+
+	// Publisher starts with an already-closed channel (channel-only
+	// failure); Publish must lazily re-open before sending.
+	p := &Publisher{conn: conn, ch: closedCh, publishConfirms: true}
+
+	if err := p.Publish(Message{Exchange: "ex", RoutingKey: "rk", Message: []byte("hi")}); err != nil {
+		t.Fatalf("Publish() error = %v, want nil", err)
+	}
+
+	if opens.Load() != 1 {
+		t.Fatalf("expected channel re-opened once, got %d", opens.Load())
+	}
+	if p.channel() != freshCh {
+		t.Fatal("expected publisher to use the freshly opened channel")
+	}
+}
+
+func TestEnsureChannel_NoReopenDuringShutdown(t *testing.T) {
+	var opens atomic.Int32
+
+	closedCh := &mockAMQPChannel{
+		IsClosedFn: func() bool { return true },
+	}
+	conn := &mockConnProvider{
+		ChannelFn: func() (amqpx.AMQPChannel, error) {
+			opens.Add(1)
+			return &mockAMQPChannel{}, nil
+		},
+	}
+
+	p := &Publisher{conn: conn, ch: closedCh, publishConfirms: true}
+	p.closing.Store(true)
+
+	if err := p.ensureChannel(); err == nil {
+		t.Fatal("expected error when re-opening during shutdown")
+	}
+	if opens.Load() != 0 {
+		t.Fatal("expected no channel re-open during shutdown")
 	}
 }

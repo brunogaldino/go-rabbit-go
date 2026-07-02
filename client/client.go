@@ -17,6 +17,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,6 +34,46 @@ import (
 // reconnectDelay is a variable so tests can shorten the backoff.
 var reconnectDelay = 5 * time.Second
 
+// terminalCloseCodes are AMQP reply codes that signal a deliberate or
+// unrecoverable close for which reconnection must not be attempted.
+var terminalCloseCodes = map[int]struct{}{
+	amqp.ChannelError:       {}, // 504
+	amqp.PreconditionFailed: {}, // 406
+	amqp.NotAllowed:         {}, // 530
+	amqp.AccessRefused:      {}, // 403
+}
+
+// terminalCloseReasons are case-insensitive substrings of an
+// [amqp.Error.Reason] that mark a close as terminal (e.g. an operator
+// killing the connection through the RabbitMQ management plugin).
+var terminalCloseReasons = []string{
+	"closed via management plugin",
+}
+
+// isTerminalClose reports whether a connection-close error should end the
+// monitor without reconnecting. Any other non-nil close is treated as an
+// unexpected drop and triggers reconnection, regardless of the amqp
+// library's Recover flag (which is only set for soft channel exceptions
+// and is false for the connection drops we actually want to recover from).
+func isTerminalClose(err *amqp.Error) bool {
+	if err == nil {
+		return false
+	}
+
+	if _, ok := terminalCloseCodes[err.Code]; ok {
+		return true
+	}
+
+	reason := strings.ToLower(err.Reason)
+	for _, r := range terminalCloseReasons {
+		if strings.Contains(reason, r) {
+			return true
+		}
+	}
+
+	return false
+}
+
 // Config holds the connection parameters for a [Client].
 type Config struct {
 	// URI is the AMQP connection string (e.g. "amqp://guest:guest@localhost:5672/").
@@ -42,6 +83,8 @@ type Config struct {
 	// MaxReconnectAttempts limits how many times the client will try to
 	// re-establish a dropped connection before giving up.
 	MaxReconnectAttempts int
+	// Throws a Fatal when the MaxReconnectAttempts reaches maximum
+	FatalOnDisconnnect bool
 	// Logger overrides the default logger. When nil, a default logger
 	// that writes to stdout is used.
 	Logger rabbitmq.Logger
@@ -142,14 +185,29 @@ func (c *Client) Channel() (amqpx.AMQPChannel, error) {
 		return nil, err
 	}
 
-	return c.con.Conn.Channel()
+	c.conMu.Lock()
+	conn := c.con.Conn
+	c.conMu.Unlock()
+
+	return conn.Channel()
 }
 
-func (c *Client) Connected() bool             { return c.con.IsConnected.Load() }
-func (c *Client) Closing() bool               { return c.isClosing.Load() }
-func (c *Client) Host() string                { return c.hostname }
-func (c *Client) Logger() rabbitmq.Logger     { return c.logger }
-func (c *Client) LogType() rabbitmq.LogType   { return c.logType }
+// Connected reports whether the consumer connection is currently usable.
+// It checks the live connection object (not just the IsConnected flag)
+// so that a dropped connection is reported immediately, before the
+// connection monitor has processed the close. This prevents consumers
+// from reattaching to a dead connection during the window between the
+// drop and the monitor marking it disconnected.
+func (c *Client) Connected() bool {
+	c.conMu.Lock()
+	defer c.conMu.Unlock()
+	return c.con.IsConnected.Load() && c.con.Conn != nil && !c.con.Conn.IsClosed()
+}
+
+func (c *Client) Closing() bool             { return c.isClosing.Load() }
+func (c *Client) Host() string              { return c.hostname }
+func (c *Client) Logger() rabbitmq.Logger   { return c.logger }
+func (c *Client) LogType() rabbitmq.LogType { return c.logType }
 
 func (c *Client) RegisterConsumer(name string, cons *consumer.Consumer) {
 	c.mu.Lock()
@@ -173,7 +231,11 @@ func (a *publisherConn) Channel() (amqpx.AMQPChannel, error) {
 		return nil, err
 	}
 
-	return a.c.pub.Conn.Channel()
+	a.c.pubMu.Lock()
+	conn := a.c.pub.Conn
+	a.c.pubMu.Unlock()
+
+	return conn.Channel()
 }
 func (a *publisherConn) Blocked() bool             { return a.c.isBlocked.Load() }
 func (a *publisherConn) Reconnecting() bool        { return a.c.pub.IsReconnecting.Load() }
@@ -329,6 +391,11 @@ func (c *Client) reconnectPublisher() bool {
 
 	if c.pub.ReconnectAttempt >= c.conf.MaxReconnectAttempts {
 		c.pub.IsReconnecting.Store(false)
+
+		if c.conf.FatalOnDisconnnect {
+			c.logger.Fatal(fmt.Sprintf("fatal on publisher connection: %v", rabbitmq.ErrMaxReconnectAttempts))
+		}
+
 		c.logger.Error(fmt.Sprintf("giving up on publisher connection: %v", rabbitmq.ErrMaxReconnectAttempts))
 		return false
 	}
@@ -403,6 +470,10 @@ func (c *Client) reconnectConsumer() bool {
 
 	if c.con.ReconnectAttempt >= c.conf.MaxReconnectAttempts {
 		c.con.IsReconnecting.Store(false)
+		if c.conf.FatalOnDisconnnect {
+			c.logger.Fatal(fmt.Sprintf("fatal on consumer connection: %v", rabbitmq.ErrMaxReconnectAttempts))
+		}
+
 		c.logger.Error(fmt.Sprintf("giving up on consumer connection: %v", rabbitmq.ErrMaxReconnectAttempts))
 		return false
 	}
@@ -447,9 +518,22 @@ func (c *Client) monitorPublisherConn() {
 			c.logger.Info("publisher connection UNBLOCKED")
 
 		case err := <-c.pub.NotifyError:
-			if err != nil && !err.Recover {
+			if c.isClosing.Load() || c.ctx.Err() != nil {
+				// Deliberate shutdown (Disconnect / context cancel).
+				// A graceful local Close delivers nil here and is caught
+				// by this guard, so nil is not treated as terminal below.
+				return
+			}
+
+			if isTerminalClose(err) {
 				c.pub.MarkDisconnected()
-				c.logger.Error(fmt.Sprintf("shutting down publisher connection permanently: %v", err))
+				logMsg := fmt.Sprintf("shutting down publisher connection permanently: %v", err)
+
+				if c.conf.FatalOnDisconnnect {
+					c.logger.Fatal(logMsg)
+				}
+
+				c.logger.Error(logMsg)
 				return
 			}
 
@@ -474,9 +558,19 @@ func (c *Client) monitorConsumerConn() {
 	for {
 		select {
 		case err := <-c.con.NotifyError:
-			if err != nil && !err.Recover {
+			if c.isClosing.Load() || c.ctx.Err() != nil {
+				return
+			}
+
+			if isTerminalClose(err) {
 				c.con.MarkDisconnected()
-				c.logger.Error(fmt.Sprintf("shutting down consumer connection permanently: %v", err))
+				logMsg := fmt.Sprintf("shutting down consumer connection permanently: %v", err)
+
+				if c.conf.FatalOnDisconnnect {
+					c.logger.Fatal(logMsg)
+				}
+
+				c.logger.Error(logMsg)
 				return
 			}
 
