@@ -3,6 +3,7 @@ package rabbitmq
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 )
 
 // LogType controls which inspection logs are emitted.
@@ -43,6 +44,7 @@ type Logger interface {
 	Info(msg string, data ...map[string]any)
 	// Error logs an error message with optional structured data.
 	Error(msg string, data ...map[string]any)
+	Fatal(msg string, data ...map[string]any)
 }
 
 type defaultLogger struct{}
@@ -53,6 +55,10 @@ func (l *defaultLogger) Info(msg string, data ...map[string]any) {
 
 func (l *defaultLogger) Error(msg string, data ...map[string]any) {
 	l.log("error", msg, data...)
+}
+
+func (l *defaultLogger) Fatal(msg string, data ...map[string]any) {
+	l.fatal("fatal", msg, data...)
 }
 
 func (l *defaultLogger) log(level, msg string, data ...map[string]any) {
@@ -69,6 +75,23 @@ func (l *defaultLogger) log(level, msg string, data ...map[string]any) {
 	}
 
 	fmt.Printf("[%s] %s\n", level, msg)
+}
+
+func (l *defaultLogger) fatal(level, msg string, data ...map[string]any) {
+	if len(data) > 0 {
+		entry := make(map[string]any, len(data[0])+2)
+		entry["level"] = level
+		entry["title"] = msg
+		for k, v := range data[0] {
+			entry[k] = v
+		}
+		j, _ := json.Marshal(entry)
+		fmt.Println(string(j))
+		os.Exit(-1)
+	}
+
+	fmt.Printf("[%s] %s\n", level, msg)
+	os.Exit(-1)
 }
 
 // NewDefaultLogger returns a [Logger] that writes to stdout with

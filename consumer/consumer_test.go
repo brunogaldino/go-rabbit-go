@@ -3,8 +3,10 @@ package consumer
 import (
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 
@@ -26,6 +28,7 @@ func newTestConsumer(ch amqpx.AMQPChannel, conn ConnProvider) *Consumer {
 		channel:      ch,
 		params:       defs,
 		consumerName: "test-consumer",
+		drainTimeout: defaultDrainTimeout,
 	}
 	c.params.Queue = "test-queue"
 	c.params.ExchangeName = "test-exchange"
@@ -709,5 +712,95 @@ func TestQueueError_ErrorAndUnwrap(t *testing.T) {
 	}
 	if qErr.Unwrap() != inner {
 		t.Fatal("Unwrap should return inner error")
+	}
+}
+
+func TestDisconnect_Idempotent_Concurrent(t *testing.T) {
+	var cancelCalls, closeCalls, unregisterCalls atomic.Int32
+
+	ch := &mockAMQPChannel{
+		cancelFn: func(string, bool) error { cancelCalls.Add(1); return nil },
+		closeFn:  func() error { closeCalls.Add(1); return nil },
+	}
+	conn := &mockConnProvider{
+		unregisterConsumerFn: func(string) { unregisterCalls.Add(1) },
+	}
+	c := newTestConsumer(ch, conn)
+
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Go(func() { c.Disconnect() })
+	}
+	wg.Wait()
+
+	if n := cancelCalls.Load(); n != 1 {
+		t.Fatalf("expected Cancel called once, got %d", n)
+	}
+	if n := closeCalls.Load(); n != 1 {
+		t.Fatalf("expected Close called once, got %d", n)
+	}
+	if n := unregisterCalls.Load(); n != 1 {
+		t.Fatalf("expected UnregisterConsumer called once, got %d", n)
+	}
+}
+
+func TestDisconnect_WaitsForInflightBeforeClose(t *testing.T) {
+	var closed atomic.Bool
+	var ackedBeforeClose atomic.Bool
+
+	ch := &mockAMQPChannel{
+		cancelFn: func(string, bool) error { return nil },
+		closeFn:  func() error { closed.Store(true); return nil },
+	}
+	c := newTestConsumer(ch, &mockConnProvider{})
+
+	// Simulate an in-flight handler that finishes shortly; it must
+	// complete (recording ack) before the channel is closed.
+	c.wg.Go(func() {
+		time.Sleep(50 * time.Millisecond)
+		if !closed.Load() {
+			ackedBeforeClose.Store(true)
+		}
+	})
+
+	c.Disconnect()
+
+	if !closed.Load() {
+		t.Fatal("expected channel to be closed")
+	}
+	if !ackedBeforeClose.Load() {
+		t.Fatal("expected in-flight handler to finish before channel close")
+	}
+}
+
+func TestDisconnect_DrainTimeout_DoesNotHang(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+
+	var closed atomic.Bool
+	ch := &mockAMQPChannel{
+		cancelFn: func(string, bool) error { return nil },
+		closeFn:  func() error { closed.Store(true); return nil },
+	}
+	c := newTestConsumer(ch, &mockConnProvider{})
+	c.drainTimeout = 20 * time.Millisecond
+
+	// A handler that blocks past the drain timeout.
+	c.wg.Go(func() { <-release })
+
+	done := make(chan struct{})
+	go func() {
+		c.Disconnect()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Disconnect hung despite drain timeout")
+	}
+
+	if !closed.Load() {
+		t.Fatal("expected channel to be closed after drain timeout")
 	}
 }

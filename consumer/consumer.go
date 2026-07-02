@@ -25,12 +25,13 @@ import (
 
 // Consumer timing and limit defaults.
 const (
-	pollInterval       = 500 * time.Millisecond
-	setupRetryDelay    = 1 * time.Second
-	defaultPrefetch    = 10
-	defaultMaxRetry    = 5
-	retryMultiplier    = 1000
-	defaultRandomIDLen = 4
+	pollInterval        = 500 * time.Millisecond
+	setupRetryDelay     = 1 * time.Second
+	defaultPrefetch     = 10
+	defaultMaxRetry     = 5
+	retryMultiplier     = 1000
+	defaultRandomIDLen  = 4
+	defaultDrainTimeout = 30 * time.Second
 )
 
 // Operation names used in error types.
@@ -154,12 +155,14 @@ var defaults = &Options{
 // Consumer processes messages from a single AMQP queue with automatic
 // retry and dead letter support.
 type Consumer struct {
-	conn         ConnProvider
-	channel      amqpx.AMQPChannel
-	params       Options
-	wg           sync.WaitGroup
-	consumerName string
-	closing      atomic.Bool
+	conn           ConnProvider
+	channel        amqpx.AMQPChannel
+	params         Options
+	wg             sync.WaitGroup
+	consumerName   string
+	closing        atomic.Bool
+	disconnectOnce sync.Once
+	drainTimeout   time.Duration
 }
 
 // --- Functional options ---
@@ -215,6 +218,19 @@ func WithHeadersBinding(headers map[string]any) Option {
 	return func(c *Consumer) { c.params.HeadersBinding = headers }
 }
 
+// WithShutdownDrainTimeout sets how long [Consumer.Disconnect] waits for
+// in-flight message handlers to finish (and ack) before closing the
+// channel. When the timeout elapses the channel is closed anyway and any
+// still-unacked deliveries are redelivered by the broker. A non-positive
+// duration falls back to the default (30s).
+func WithShutdownDrainTimeout(d time.Duration) Option {
+	return func(c *Consumer) {
+		if d > 0 {
+			c.drainTimeout = d
+		}
+	}
+}
+
 // --- Consumer creation ---
 
 // New creates a [Consumer] bound to the given queue. The callback is
@@ -229,7 +245,7 @@ func New(conn ConnProvider, queue string, callback Handler, options ...Option) (
 	defs.RetryStrategy = &retryCopy
 	defs.DeadletterStrategy = &dlCopy
 
-	c := &Consumer{params: defs, conn: conn}
+	c := &Consumer{params: defs, conn: conn, drainTimeout: defaultDrainTimeout}
 	c.setOptions(queue, callback, options)
 
 	if err := c.setup(); err != nil {
@@ -323,6 +339,7 @@ func (c *Consumer) Begin(groups ...string) error {
 		if err := c.setup(); err != nil {
 			c.conn.Logger().Error(fmt.Sprintf("failed to reattach consumer %s: %v", c.params.Queue, err))
 			time.Sleep(setupRetryDelay)
+			continue
 		}
 	}
 }
@@ -388,22 +405,49 @@ func (c *Consumer) processDelivery(d Delivery) {
 	handlerErr = c.params.Callback(d, c.params.Queue)
 }
 
-// Disconnect stops delivering messages, waits for in-flight handlers,
-// closes the AMQP channel, and unregisters the consumer from the client.
+// Disconnect stops delivering messages, waits for in-flight handlers
+// (up to the configured drain timeout), closes the AMQP channel, and
+// unregisters the consumer from the client. It is idempotent and safe to
+// call multiple times and from concurrent goroutines: the teardown runs
+// exactly once and every caller blocks until it completes.
 func (c *Consumer) Disconnect() {
-	c.closing.Store(true)
-	c.conn.Logger().Info(fmt.Sprintf("stopping deliveries to consumer %s", c.consumerName))
+	c.disconnectOnce.Do(func() {
+		c.closing.Store(true)
+		c.conn.Logger().Info(fmt.Sprintf("stopping deliveries to consumer %s", c.consumerName))
 
-	if err := c.channel.Cancel(c.consumerName, false); err != nil {
-		c.conn.Logger().Error(fmt.Sprintf("cancel consumer %s: %v", c.consumerName, err))
+		if err := c.channel.Cancel(c.consumerName, false); err != nil {
+			c.conn.Logger().Error(fmt.Sprintf("cancel consumer %s: %v", c.consumerName, err))
+		}
+
+		if !c.waitDrain() {
+			c.conn.Logger().Error(fmt.Sprintf(
+				"drain timeout for consumer %s after %s; closing channel, unacked messages will be redelivered",
+				c.consumerName, c.drainTimeout))
+		}
+
+		if err := c.channel.Close(); err != nil {
+			c.conn.Logger().Error(fmt.Sprintf("close consumer channel %s [RK: %s]: %v", c.params.Queue, c.params.RoutingKey, err))
+		}
+
+		c.conn.UnregisterConsumer(c.consumerName)
+	})
+}
+
+// waitDrain blocks until all in-flight handlers finish or the drain
+// timeout elapses. It reports whether the drain completed in time.
+func (c *Consumer) waitDrain() bool {
+	done := make(chan struct{})
+	go func() {
+		c.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return true
+	case <-time.After(c.drainTimeout):
+		return false
 	}
-	c.wg.Wait()
-
-	if err := c.channel.Close(); err != nil {
-		c.conn.Logger().Error(fmt.Sprintf("close consumer channel %s [RK: %s]: %v", c.params.Queue, c.params.RoutingKey, err))
-	}
-
-	c.conn.UnregisterConsumer(c.consumerName)
 }
 
 // --- Retry and dead letter ---

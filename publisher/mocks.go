@@ -208,6 +208,7 @@ func (m *mockAMQPChannel) IsClosed() bool {
 type mockLogger struct {
 	InfoFn  func(msg string, data ...map[string]any)
 	ErrorFn func(msg string, data ...map[string]any)
+	FatalFn func(msg string, data ...map[string]any)
 }
 
 func (m *mockLogger) Info(msg string, data ...map[string]any) {
@@ -217,6 +218,12 @@ func (m *mockLogger) Info(msg string, data ...map[string]any) {
 }
 
 func (m *mockLogger) Error(msg string, data ...map[string]any) {
+	if m.ErrorFn != nil {
+		m.ErrorFn(msg, data...)
+	}
+}
+
+func (m *mockLogger) Fatal(msg string, data ...map[string]any) {
 	if m.ErrorFn != nil {
 		m.ErrorFn(msg, data...)
 	}

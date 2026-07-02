@@ -96,6 +96,15 @@ func (l *mockLogger) Error(msg string, data ...map[string]any) {
 	l.errors = append(l.errors, msg)
 }
 
+func (l *mockLogger) Fatal(msg string, data ...map[string]any) {
+	if l.disabled {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.errors = append(l.errors, msg)
+}
+
 var (
 	_ amqpx.Dialer         = (*mockDialer)(nil)
 	_ amqpx.AMQPConnection = (*mockAMQPConnection)(nil)

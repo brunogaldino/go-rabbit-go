@@ -422,6 +422,37 @@ func TestCheckHealth_Defaults(t *testing.T) {
 	}
 }
 
+func TestConnected_FalseWhenUnderlyingConnClosed(t *testing.T) {
+	var closed atomic.Bool
+	conn := &mockAMQPConnection{
+		isClosedFn: func() bool { return closed.Load() },
+	}
+	c, _ := newTestClient(t, func(string, amqp.Config) (amqpx.AMQPConnection, error) {
+		return conn, nil
+	})
+	defer c.Disconnect()
+
+	// Establish the consumer connection.
+	if _, err := c.Channel(); err != nil {
+		t.Fatalf("Channel() error: %v", err)
+	}
+
+	if !c.Connected() {
+		t.Fatal("expected Connected true after establishing the consumer connection")
+	}
+
+	// Simulate a broker-side drop: the underlying connection reports
+	// closed, but the connection monitor has not yet processed the
+	// NotifyError and flipped the IsConnected flag. Connected() must
+	// still report false so consumers do not reattach to a dead
+	// connection.
+	closed.Store(true)
+
+	if c.Connected() {
+		t.Fatal("expected Connected false once the underlying connection is closed, even before the monitor marks it disconnected")
+	}
+}
+
 func TestDisconnect_Idempotent(t *testing.T) {
 	c, _ := newTestClient(t, successDialFn())
 	if err := c.Connect(); err != nil {
@@ -532,7 +563,10 @@ func dropConnectionsClient(t *testing.T, maxReconnect int) (*Client, *sync.WaitG
 }
 
 func dropConn(ch chan *amqp.Error) {
-	ch <- &amqp.Error{Code: amqp.ConnectionForced, Reason: "test drop", Recover: true}
+	// A realistic unexpected drop: real broker restarts / socket EOF /
+	// heartbeat timeouts deliver Recover == false. ConnectionForced (320)
+	// is not in the terminal set, so the monitor must still reconnect.
+	ch <- &amqp.Error{Code: amqp.ConnectionForced, Reason: "test drop", Recover: false}
 	close(ch)
 }
 
@@ -633,5 +667,92 @@ func TestMonitors_ExhaustsAllAttempts_BothRoles(t *testing.T) {
 
 	if h.Reconnecting {
 		t.Fatal("expected Reconnecting false after giving up")
+	}
+}
+
+// closeConn simulates the broker delivering a specific close error and
+// then closing the NotifyError channel, mirroring amqp091-go behaviour.
+func closeConn(ch chan *amqp.Error, err *amqp.Error) {
+	ch <- err
+	close(ch)
+}
+
+func TestMonitors_TerminalClose_NoReconnect(t *testing.T) {
+	// A terminal close (here: reason "closed via management plugin", the
+	// operator killing the connection) must make both monitors exit
+	// WITHOUT attempting any redial, even though MaxReconnectAttempts > 0.
+	oldDelay := reconnectDelay
+	reconnectDelay = 10 * time.Millisecond
+	defer func() { reconnectDelay = oldDelay }()
+
+	c, wg, dials, notify := dropConnectionsClient(t, 5)
+
+	terminal := &amqp.Error{
+		Code:    amqp.ConnectionForced,
+		Reason:  "CONNECTION_FORCED - closed via management plugin",
+		Recover: false,
+	}
+	closeConn(notify[0], terminal)
+	closeConn(notify[1], terminal)
+
+	waitOrFail(t, wg, "monitors did not exit on terminal close")
+
+	// Only the 2 initial dials: no redial may be attempted.
+	if n := dials.Load(); n != 2 {
+		t.Fatalf("expected 2 dials (no redials on terminal close), got %d", n)
+	}
+
+	if h := c.CheckHealth(); h.Reconnecting {
+		t.Fatal("expected Reconnecting false after terminal close")
+	}
+}
+
+func TestMonitors_TerminalCloseByCode_NoReconnect(t *testing.T) {
+	// A terminal reply code (AccessRefused, 403) must also stop the
+	// monitors without any redial attempt.
+	oldDelay := reconnectDelay
+	reconnectDelay = 10 * time.Millisecond
+	defer func() { reconnectDelay = oldDelay }()
+
+	c, wg, dials, notify := dropConnectionsClient(t, 5)
+
+	terminal := &amqp.Error{Code: amqp.AccessRefused, Reason: "ACCESS_REFUSED", Recover: false}
+	closeConn(notify[0], terminal)
+	closeConn(notify[1], terminal)
+
+	waitOrFail(t, wg, "monitors did not exit on terminal reply code")
+
+	if n := dials.Load(); n != 2 {
+		t.Fatalf("expected 2 dials (no redials on terminal code), got %d", n)
+	}
+
+	if h := c.CheckHealth(); h.Reconnecting {
+		t.Fatal("expected Reconnecting false after terminal close")
+	}
+}
+
+func TestMonitors_GracefulShutdown_NoReconnect(t *testing.T) {
+	// A deliberate Disconnect closes the connections; the monitors read
+	// the resulting nil close but must exit via the isClosing guard
+	// without attempting any reconnection.
+	oldDelay := reconnectDelay
+	reconnectDelay = 10 * time.Millisecond
+	defer func() { reconnectDelay = oldDelay }()
+
+	c, wg, dials, notify := dropConnectionsClient(t, 5)
+
+	c.Disconnect()
+	// Deliver the nil close that a graceful Close produces.
+	closeConn(notify[0], nil)
+	closeConn(notify[1], nil)
+
+	waitOrFail(t, wg, "monitors did not exit on graceful shutdown")
+
+	if n := dials.Load(); n != 2 {
+		t.Fatalf("expected 2 dials (no redials on graceful shutdown), got %d", n)
+	}
+
+	if h := c.CheckHealth(); h.Reconnecting {
+		t.Fatal("expected Reconnecting false after graceful shutdown")
 	}
 }
