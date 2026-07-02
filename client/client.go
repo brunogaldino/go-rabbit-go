@@ -84,7 +84,7 @@ type Config struct {
 	// re-establish a dropped connection before giving up.
 	MaxReconnectAttempts int
 	// Throws a Fatal when the MaxReconnectAttempts reaches maximum
-	FatalOnDisconnnect bool
+	FatalOnDisconnect bool
 	// Logger overrides the default logger. When nil, a default logger
 	// that writes to stdout is used.
 	Logger rabbitmq.Logger
@@ -392,7 +392,7 @@ func (c *Client) reconnectPublisher() bool {
 	if c.pub.ReconnectAttempt >= c.conf.MaxReconnectAttempts {
 		c.pub.IsReconnecting.Store(false)
 
-		if c.conf.FatalOnDisconnnect {
+		if c.conf.FatalOnDisconnect {
 			c.logger.Fatal(fmt.Sprintf("fatal on publisher connection: %v", rabbitmq.ErrMaxReconnectAttempts))
 		}
 
@@ -470,7 +470,7 @@ func (c *Client) reconnectConsumer() bool {
 
 	if c.con.ReconnectAttempt >= c.conf.MaxReconnectAttempts {
 		c.con.IsReconnecting.Store(false)
-		if c.conf.FatalOnDisconnnect {
+		if c.conf.FatalOnDisconnect {
 			c.logger.Fatal(fmt.Sprintf("fatal on consumer connection: %v", rabbitmq.ErrMaxReconnectAttempts))
 		}
 
@@ -529,7 +529,7 @@ func (c *Client) monitorPublisherConn() {
 				c.pub.MarkDisconnected()
 				logMsg := fmt.Sprintf("shutting down publisher connection permanently: %v", err)
 
-				if c.conf.FatalOnDisconnnect {
+				if c.conf.FatalOnDisconnect {
 					c.logger.Fatal(logMsg)
 				}
 
@@ -566,7 +566,7 @@ func (c *Client) monitorConsumerConn() {
 				c.con.MarkDisconnected()
 				logMsg := fmt.Sprintf("shutting down consumer connection permanently: %v", err)
 
-				if c.conf.FatalOnDisconnnect {
+				if c.conf.FatalOnDisconnect {
 					c.logger.Fatal(logMsg)
 				}
 
