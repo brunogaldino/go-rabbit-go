@@ -804,3 +804,323 @@ func TestDisconnect_DrainTimeout_DoesNotHang(t *testing.T) {
 		t.Fatal("expected channel to be closed after drain timeout")
 	}
 }
+
+// disconnectWithin fails the test if Disconnect does not return within d.
+func disconnectWithin(t *testing.T, c *Consumer, d time.Duration) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		c.Disconnect()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(d):
+		t.Fatal("Disconnect did not return in time")
+	}
+}
+
+func TestDisconnect_DrainsDeliveriesBufferedBeforeCancelOk(t *testing.T) {
+	deliveries := make(chan amqp.Delivery, 1)
+	consuming := make(chan struct{})
+	var closed, handled, ackedAfterClose atomic.Bool
+
+	ack := &mockAcknowledger{
+		ackFn: func(uint64, bool) error {
+			if closed.Load() {
+				ackedAfterClose.Store(true)
+			}
+			return nil
+		},
+	}
+	ch := &mockAMQPChannel{
+		consumeFn: func(string, string, bool, bool, bool, bool, amqp.Table) (<-chan amqp.Delivery, error) {
+			close(consuming)
+			return deliveries, nil
+		},
+		// Like amqp091, a delivery buffered before cancel-ok still reaches
+		// the loop after Cancel returns; then the delivery channel closes.
+		cancelFn: func(string, bool) error {
+			go func() {
+				time.Sleep(20 * time.Millisecond)
+				deliveries <- amqp.Delivery{Acknowledger: ack, Body: []byte("late"), Headers: amqp.Table{}}
+				close(deliveries)
+			}()
+			return nil
+		},
+		closeFn: func() error { closed.Store(true); return nil },
+	}
+	c := newTestConsumer(ch, &mockConnProvider{})
+	c.params.Callback = func(Delivery, string) error {
+		handled.Store(true)
+		return nil
+	}
+
+	begun := make(chan error, 1)
+	go func() { begun <- c.Begin() }()
+
+	select {
+	case <-consuming:
+	case <-time.After(2 * time.Second):
+		t.Fatal("consumer did not start consuming")
+	}
+
+	disconnectWithin(t, c, 2*time.Second)
+
+	if !handled.Load() {
+		t.Fatal("expected the late delivery to be handled before Disconnect returned")
+	}
+	if ackedAfterClose.Load() {
+		t.Fatal("expected the late delivery to be acked before the channel was closed")
+	}
+
+	select {
+	case <-begun:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Begin did not return after Disconnect")
+	}
+}
+
+func TestDisconnect_DuringConsume_DrainsLoop(t *testing.T) {
+	deliveries := make(chan amqp.Delivery, 1)
+	inConsume := make(chan struct{})
+	release := make(chan struct{})
+	var closed, handled, ackedAfterClose atomic.Bool
+
+	deliveries <- amqp.Delivery{
+		Acknowledger: &mockAcknowledger{ackFn: func(uint64, bool) error {
+			if closed.Load() {
+				ackedAfterClose.Store(true)
+			}
+			return nil
+		}},
+		Body:    []byte("first"),
+		Headers: amqp.Table{},
+	}
+	ch := &mockAMQPChannel{
+		// Consume is still in flight when Disconnect starts.
+		consumeFn: func(string, string, bool, bool, bool, bool, amqp.Table) (<-chan amqp.Delivery, error) {
+			close(inConsume)
+			<-release
+			return deliveries, nil
+		},
+		cancelFn: func(string, bool) error { close(deliveries); return nil },
+		closeFn:  func() error { closed.Store(true); return nil },
+	}
+	c := newTestConsumer(ch, &mockConnProvider{})
+	c.params.Callback = func(Delivery, string) error {
+		handled.Store(true)
+		return nil
+	}
+
+	begun := make(chan error, 1)
+	go func() { begun <- c.Begin() }()
+
+	select {
+	case <-inConsume:
+	case <-time.After(2 * time.Second):
+		t.Fatal("consumer did not start consuming")
+	}
+
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		close(release)
+	}()
+	disconnectWithin(t, c, 2*time.Second)
+
+	if !handled.Load() {
+		t.Fatal("expected the delivery from the in-flight Consume to be handled before Disconnect returned")
+	}
+	if ackedAfterClose.Load() {
+		t.Fatal("expected the delivery to be acked before the channel was closed")
+	}
+
+	select {
+	case <-begun:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Begin did not return after Disconnect")
+	}
+}
+
+func TestDisconnect_DuringFailedConsume_DoesNotReconnect(t *testing.T) {
+	inConsume := make(chan struct{})
+	release := make(chan struct{})
+	var reopened atomic.Bool
+
+	ch := &mockAMQPChannel{
+		// Consume is in flight when Disconnect starts, then fails.
+		consumeFn: func(string, string, bool, bool, bool, bool, amqp.Table) (<-chan amqp.Delivery, error) {
+			close(inConsume)
+			<-release
+			return nil, errors.New("consume failed")
+		},
+	}
+	conn := &mockConnProvider{
+		channelFn: func() (amqpx.AMQPChannel, error) {
+			reopened.Store(true)
+			return &mockAMQPChannel{}, nil
+		},
+	}
+	c := newTestConsumer(ch, conn)
+
+	begun := make(chan error, 1)
+	go func() { begun <- c.Begin() }()
+
+	select {
+	case <-inConsume:
+	case <-time.After(2 * time.Second):
+		t.Fatal("consumer did not start consuming")
+	}
+
+	disconnected := make(chan struct{})
+	go func() {
+		c.Disconnect()
+		close(disconnected)
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !c.closing.Load() {
+		if time.Now().After(deadline) {
+			close(release)
+			t.Fatal("expected Disconnect to set closing while Consume was in flight")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(release)
+
+	select {
+	case <-disconnected:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Disconnect did not return in time")
+	}
+
+	select {
+	case <-begun:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Begin did not return after Disconnect")
+	}
+
+	if reopened.Load() {
+		t.Fatal("expected Begin not to reopen the channel after Disconnect")
+	}
+}
+
+func TestDisconnect_DuringReconnect_DoesNotConsume(t *testing.T) {
+	var c *Consumer
+	var consumedAfterDisconnect atomic.Bool
+
+	dropped := make(chan amqp.Delivery)
+	close(dropped)
+	first := &mockAMQPChannel{
+		consumeFn: func(string, string, bool, bool, bool, bool, amqp.Table) (<-chan amqp.Delivery, error) {
+			return dropped, nil
+		},
+	}
+	reopened := &mockAMQPChannel{
+		consumeFn: func(string, string, bool, bool, bool, bool, amqp.Table) (<-chan amqp.Delivery, error) {
+			consumedAfterDisconnect.Store(true)
+			deliveries := make(chan amqp.Delivery)
+			close(deliveries)
+			return deliveries, nil
+		},
+	}
+	conn := &mockConnProvider{
+		// Disconnect lands while Begin reopens the channel after a drop.
+		channelFn: func() (amqpx.AMQPChannel, error) {
+			c.Disconnect()
+			return reopened, nil
+		},
+	}
+	c = newTestConsumer(first, conn)
+
+	begun := make(chan error, 1)
+	go func() { begun <- c.Begin() }()
+
+	select {
+	case err := <-begun:
+		if err != nil {
+			t.Fatalf("expected Begin to return nil after Disconnect, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Begin did not return after Disconnect")
+	}
+
+	if consumedAfterDisconnect.Load() {
+		t.Fatal("expected Begin not to consume on the channel reopened after Disconnect")
+	}
+}
+
+func TestDisconnect_BeforeBegin_DoesNotConsume(t *testing.T) {
+	var consumed atomic.Bool
+	ch := &mockAMQPChannel{
+		consumeFn: func(string, string, bool, bool, bool, bool, amqp.Table) (<-chan amqp.Delivery, error) {
+			consumed.Store(true)
+			deliveries := make(chan amqp.Delivery)
+			close(deliveries)
+			return deliveries, nil
+		},
+	}
+	c := newTestConsumer(ch, &mockConnProvider{})
+
+	disconnectWithin(t, c, 2*time.Second)
+
+	begun := make(chan error, 1)
+	go func() { begun <- c.Begin() }()
+
+	select {
+	case err := <-begun:
+		if err != nil {
+			t.Fatalf("expected Begin to return nil after Disconnect, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Begin did not return after Disconnect")
+	}
+
+	if consumed.Load() {
+		t.Fatal("expected Begin not to start consuming after Disconnect")
+	}
+}
+
+func TestDisconnect_StuckConsumeLoop_RespectsDrainTimeout(t *testing.T) {
+	deliveries := make(chan amqp.Delivery)
+	consuming := make(chan struct{})
+	var closed atomic.Bool
+	ch := &mockAMQPChannel{
+		consumeFn: func(string, string, bool, bool, bool, bool, amqp.Table) (<-chan amqp.Delivery, error) {
+			close(consuming)
+			return deliveries, nil
+		},
+		// If Cancel fails without closing the delivery channel, only
+		// closing the channel ends the loop.
+		cancelFn: func(string, bool) error { return errors.New("cancel failed") },
+		closeFn: func() error {
+			closed.Store(true)
+			close(deliveries)
+			return nil
+		},
+	}
+	c := newTestConsumer(ch, &mockConnProvider{})
+	c.drainTimeout = 20 * time.Millisecond
+
+	begun := make(chan error, 1)
+	go func() { begun <- c.Begin() }()
+
+	select {
+	case <-consuming:
+	case <-time.After(2 * time.Second):
+		t.Fatal("consumer did not start consuming")
+	}
+
+	disconnectWithin(t, c, 2*time.Second)
+
+	if !closed.Load() {
+		t.Fatal("expected channel to be closed after drain timeout")
+	}
+
+	select {
+	case <-begun:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Begin did not return after Disconnect")
+	}
+}

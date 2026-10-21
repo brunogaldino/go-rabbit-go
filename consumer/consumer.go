@@ -163,6 +163,7 @@ type Consumer struct {
 	closing        atomic.Bool
 	disconnectOnce sync.Once
 	drainTimeout   time.Duration
+	loopMu         sync.Mutex
 }
 
 // --- Functional options ---
@@ -356,11 +357,26 @@ func (c *Consumer) waitForReconnect() bool {
 }
 
 func (c *Consumer) consume() {
+	// Held across Consume so Disconnect either keeps the loop from
+	// starting or finds its WaitGroup slot already taken.
+	c.loopMu.Lock()
+	if c.closing.Load() {
+		c.loopMu.Unlock()
+		return
+	}
+
 	msgs, err := c.channel.Consume(c.params.Queue, c.consumerName, false, false, false, false, nil)
 	if err != nil {
+		c.loopMu.Unlock()
 		c.conn.Logger().Error(fmt.Sprintf("error beginning consumer %s: %v", c.params.Queue, err))
 		return
 	}
+
+	// amqp091 keeps delivering until it closes msgs, even after Cancel;
+	// holding a slot keeps every wg.Go ahead of a Wait that sees zero.
+	c.wg.Add(1)
+	c.loopMu.Unlock()
+	defer c.wg.Done()
 
 	for msg := range msgs {
 		d := Delivery{
@@ -405,14 +421,19 @@ func (c *Consumer) processDelivery(d Delivery) {
 	handlerErr = c.params.Callback(d, c.params.Queue)
 }
 
-// Disconnect stops delivering messages, waits for in-flight handlers
-// (up to the configured drain timeout), closes the AMQP channel, and
+// Disconnect stops delivering messages, waits for in-flight handlers,
+// including deliveries the broker sent before confirming the cancel (up
+// to the configured drain timeout), closes the AMQP channel, and
 // unregisters the consumer from the client. It is idempotent and safe to
 // call multiple times and from concurrent goroutines: the teardown runs
 // exactly once and every caller blocks until it completes.
 func (c *Consumer) Disconnect() {
 	c.disconnectOnce.Do(func() {
 		c.closing.Store(true)
+		// consume() checks closing and takes its WaitGroup slot under
+		// loopMu: once we hold it, a loop is either counted or never starts.
+		c.loopMu.Lock()
+		c.loopMu.Unlock()
 		c.conn.Logger().Info(fmt.Sprintf("stopping deliveries to consumer %s", c.consumerName))
 
 		if err := c.channel.Cancel(c.consumerName, false); err != nil {
